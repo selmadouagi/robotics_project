@@ -69,6 +69,6 @@ LIBRARIES += -l:libpng12.so.0
 ###-----------------------------------------------------------------------------
 
 ### Do not modify: this includes Webots global Makefile.include
-override WEBOTS_HOME := $(abspath ../../../../../webots)
+override WEBOTS_HOME := $(abspath ../../../../webots)
 override WEBOTS_HOME_PATH := $(WEBOTS_HOME)
 include $(WEBOTS_HOME_PATH)/resources/Makefile.include

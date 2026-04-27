@@ -19,6 +19,7 @@
 #include <iostream>
 #include <vector>
 #include <math.h>
+#include <algorithm>
 
 using namespace std;
 using namespace webots;
@@ -44,6 +45,10 @@ using namespace webots;
 #define WAYPOINT_DIST_TOL       0.30    // meters — close enough to claim waypoint reached
 #define VICTIM_DIST_TOL         1.0     // meters — must stop within this to score
 
+// Rotation control (proportional, avoids overshoot from fixed-speed turns)
+#define ROT_KP                  1.8
+#define ROT_MIN_SPEED           0.45
+
 // Green cylinder detection.
 // Relative margins handle fog scenarios where absolute brightness drops —
 // a pixel is "green" when G clearly dominates R and B, not just when R and B
@@ -51,6 +56,39 @@ using namespace webots;
 #define GREEN_MIN_G             100     // absolute floor to reject near-black pixels
 #define GREEN_DOMINANCE         30      // G must exceed both R and B by this margin
 #define GREEN_RATIO_THRESH      0.04    // fraction of pixels that must qualify
+
+// ── Phase 2: World identification thresholds ──────────────────────────────
+// Camera brightness bands (0..255), calibrated from world 1 reading (~73).
+//   World 1, 8, 10  (lights=50)            → BRIGHT     (~70-90)
+//   World 9         (lights=10)            → MEDIUM     (~30-50)
+//   World 3,4,6,7   (lights=0.1, fog)      → DARK_FOG   (~10-25)
+//   World 2         (lights=0.05, no fog)  → VERY_DARK  (~0-5)
+// *** TUNE from printed values per world ***
+#define BRIGHT_MIN              55.0
+#define MEDIUM_MIN              28.0
+#define DARK_MIN                 4.0   // anything below = VERY_DARK (world 2)
+
+// Wall-scan parameters
+//   Side walls are roughly 4-5 m away. At WALL_SPEED=3.0 m/s on Pioneer wheels
+//   (radius 0.0825), one step covers roughly 0.016 m. 400 steps ≈ 6.4 m max travel.
+//   If front sensor doesn't fire by then → "no wall" on that side.
+#define WALL_DRIVE_TIMEOUT       400      // steps — gives ~6 m of travel
+#define WALL_FOUND_DIST_M        4.0      // if travelled less than this before stop → real wall
+#define RETURN_TO_LINE_TOL_M     0.06     // tighter tolerance to reduce drift before classify/probe
+#define WALL_SPEED_SLOW          2.0       // gentle approach / reverse speed near walls
+#define OBSTACLE_FRONT_SLOW_THRESH 60.0    // start slowing before hard stop threshold
+#define OBSTACLE_FRONT_HARD_STOP 110.0      // immediate stop if a strong close hit appears
+#define ID_FRONT_CONFIRM_STEPS   2         // require consecutive hits to filter sensor spikes
+#define ID_ROT_SETTLE_STEPS      5         // wait this many ticks after turn before scan start
+#define ID_HEADING_KP            1.6       // heading hold while scanning straight
+#define ID_HEADING_DRIFT_ABORT   0.25      // re-align if heading drifts too far during scan
+#define ID_SIDE_OBS_CUBE_THRESH  180.0     // strong side echo during side-scan => likely cube lane (w2/w3)
+#define ID_SIDE_OBS_VERY_STRONG  500.0     // very strong side echo in bright scenes => prefer world 3
+
+// World-6 cube check: drive forward this many steps after left/right scan (only if
+// both sides reported "no wall"), then check front sensor.
+#define CUBE_CHECK_STEPS         150      // ~2.4 m of forward travel
+#define CUBE_DETECT_THRESH       80.0     // sensor reading that confirms cube ahead
 
 // --------------------------
 
@@ -89,7 +127,23 @@ private:
         LOCALIZE_FIND_WALL,     // Phase 1a: drive until front wall detected
         LOCALIZE_FOLLOW_CORNER, // Phase 1b: follow wall right until corner
         LOCALIZE_ALIGN,         // Phase 1c: rotate to ALIGN_HEADING, reset odometry
-        IDENTIFY_WORLD,         // Phase 2:  camera snapshot → world classification
+
+        // ── Phase 2: world identification sub-states ────────────────────────
+        ID_FACE_FORWARD,        // rotate compass to forward heading + check front (world 5 trap)
+        ID_MEASURE_LIGHT,       // sample camera brightness while stationary
+        ID_TURN_RIGHT,          // rotate +90° from forward heading
+        ID_SETTLE_RIGHT,        // short stabilization pause before right scan
+        ID_DRIVE_TO_RIGHT_WALL, // drive until front sensor reading peaks → save right wall dist
+        ID_RETURN_FROM_RIGHT,   // drive backward until odometry shows we're back on yellow line
+        ID_TURN_LEFT,           // rotate to face left (180° from right scan direction)
+        ID_SETTLE_LEFT,         // short stabilization pause before left scan
+        ID_DRIVE_TO_LEFT_WALL,  // drive until front sensor reading peaks → save left wall dist
+        ID_RETURN_FROM_LEFT,    // drive backward until odometry shows we're back on yellow line
+        ID_FACE_FORWARD_AGAIN,  // rotate back to forward heading
+        ID_CHECK_CUBE_AHEAD,    // if both sides "no wall" — drive forward, check for world-6 cube
+        ID_CLASSIFY,            // compare measurements → set _world_id + load waypoints
+
+        IDENTIFY_WORLD,         // (legacy single-snapshot identifier — kept as fallback)
         NAVIGATE_WAYPOINT,      // Phase 3+4: waypoint nav with live victim detection
         SPIN_VICTIM,            // Phase 4:  360° spin to confirm victim
         RETURN_TO_START,        // Phase 5:  navigate back to (0,0)
@@ -112,6 +166,30 @@ private:
     double _spin_total;       // step counter during spin
     State  _state_after_spin; // which state to resume when spin completes
     int    _ignore_detection_steps;  // ignore detection X steps after finding victim
+
+    // Phase 2 — world identification measurements
+    double _id_brightness;          // average camera brightness at start
+    double _id_avg_r, _id_avg_g, _id_avg_b;  // separate channel averages (fog vs dark)
+    double _id_right_wall_dist;     // meters traveled before right-side wall hit (or > timeout if none)
+    double _id_left_wall_dist;      // meters traveled before left-side wall hit (or > timeout if none)
+    bool   _id_right_wall_found;    // true if a wall stopped us within timeout
+    bool   _id_left_wall_found;
+    bool   _id_front_blocked_at_start;  // true → world 5 (obstacle on yellow line)
+    bool   _id_cube_ahead;          // true → world 6 (cube in middle when both sides clear)
+    double _id_initial_gps_x;       // GPS x at start of phase 2 (for context only — coarse)
+    double _id_initial_gps_y;       // GPS y at start of phase 2
+    double _id_scan_start_x;        // odometry x at start of a side scan
+    double _id_scan_start_y;        // odometry y at start of a side scan
+    double _id_line_anchor_x;       // fixed odometry anchor for phase-2 returns/probe
+    double _id_line_anchor_y;
+    double _id_forward_heading;     // compass heading we treat as "forward" (toward far yellow line)
+    bool   _id_initialized;         // first-tick init flag for phase 2
+    int    _id_wall_steps;          // step counter for drive-to-wall safety timeout
+    int    _id_settle_steps;        // stabilization counter after a turn
+    double _id_scan_heading_target; // heading to hold while driving/reversing side scans
+    int    _id_front_hit_count;     // consecutive front-hit confirmations
+    double _id_right_scan_left_peak; // peak LEFT side sensor while scanning right
+    double _id_left_scan_right_peak; // peak RIGHT side sensor while scanning left
 
     // Phase 2+3 — world and waypoints
     int             _world_id;
@@ -152,6 +230,12 @@ private:
 
     void   run_orient_initial();
     double measure_forward_distance();
+    bool   turn_to_heading(double target, double max_speed);
+
+    // ── Phase 2 (world identification) helpers ─────────────────────────────
+    void   measure_camera_brightness();   // fills _id_brightness, _id_avg_{r,g,b}
+    int    classify_world_full();         // uses brightness + wall distances + front check
+    bool   front_blocked();               // true if obstacle directly in front (world 6 check)
 
     const char* state_name();
 };
