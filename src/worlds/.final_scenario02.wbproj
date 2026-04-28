@@ -7,6 +7,6 @@ centralWidgetVisible: 1
 selectionDisabled: 0
 viewpointLocked: 0
 orthographicViewHeight: 1
-textFiles: 2 "controllers/yay/MyRobot.cpp" "controllers/yay/MyRobot.h" "controllers/yay/new.cpp" "controllers/yay/Makefile"
+textFiles: 2 "controllers/yay/MyRobot.h" "controllers/yay/new.cpp" "controllers/yay/Makefile"
 renderingDevicePerspectives: Pioneer 2:camera_f;1;1;0;0
 renderingDevicePerspectives: Pioneer 2:camera_s;1;1;0;0

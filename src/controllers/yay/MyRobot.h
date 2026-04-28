@@ -64,9 +64,10 @@ using namespace webots;
 //   World 3,4,6,7   (lights=0.1, fog)      → DARK_FOG   (~10-25)
 //   World 2         (lights=0.05, no fog)  → VERY_DARK  (~0-5)
 // *** TUNE from printed values per world ***
-#define BRIGHT_MIN              55.0
-#define MEDIUM_MIN              28.0
-#define DARK_MIN                 4.0   // anything below = VERY_DARK (world 2)
+#define DARK_MAX        65.0     // monde 9
+#define MEDIUM_MIN      70.0
+#define BRIGHT_MIN      85.0
+#define VERY_BRIGHT_MIN 105.0    // monde 3 / 6
 
 // Wall-scan parameters
 //   Side walls are roughly 4-5 m away. At WALL_SPEED=3.0 m/s on Pioneer wheels
@@ -75,7 +76,7 @@ using namespace webots;
 #define WALL_DRIVE_TIMEOUT       400      // steps — gives ~6 m of travel
 #define WALL_FOUND_DIST_M        4.0      // if travelled less than this before stop → real wall
 #define RETURN_TO_LINE_TOL_M     0.06     // tighter tolerance to reduce drift before classify/probe
-#define WALL_SPEED_SLOW          2.0       // gentle approach / reverse speed near walls
+#define WALL_SPEED_SLOW          2.0       // Slow approach speed for center probes
 #define OBSTACLE_FRONT_SLOW_THRESH 60.0    // start slowing before hard stop threshold
 #define OBSTACLE_FRONT_HARD_STOP 110.0      // immediate stop if a strong close hit appears
 #define ID_FRONT_CONFIRM_STEPS   2         // require consecutive hits to filter sensor spikes
@@ -83,12 +84,19 @@ using namespace webots;
 #define ID_HEADING_KP            1.6       // heading hold while scanning straight
 #define ID_HEADING_DRIFT_ABORT   0.25      // re-align if heading drifts too far during scan
 #define ID_SIDE_OBS_CUBE_THRESH  180.0     // strong side echo during side-scan => likely cube lane (w2/w3)
-#define ID_SIDE_OBS_VERY_STRONG  500.0     // very strong side echo in bright scenes => prefer world 3
 
 // World-6 cube check: drive forward this many steps after left/right scan (only if
 // both sides reported "no wall"), then check front sensor.
 #define CUBE_CHECK_STEPS         150      // ~2.4 m of forward travel
 #define CUBE_DETECT_THRESH       80.0     // sensor reading that confirms cube ahead
+#define CUBE_MAX_DIST_M          1.2      // cube should be close; farther hits are likely room wall
+
+// Forward-probe (after each side scan, while facing room center) ------------
+//   IR sensors only see ~0.4 m, so a stationary "is there a wall in front?"
+//   reading is useless when the wall sits 2-4 m away. We instead roll forward
+//   up to PROBE_FORWARD_MAX_M and use the distance travelled as the answer.
+#define PROBE_FORWARD_MAX_M      2.0      // hard cap → if travelled this far without a hit, NO WALL ahead
+#define PROBE_FORWARD_TIMEOUT    120      // step-count safety net, ~2.4 m worst case
 
 // --------------------------
 
@@ -121,6 +129,13 @@ private:
     Camera*         _forward_camera;
     Camera*         _spherical_camera;
 
+
+    enum DetectedObject {
+    OBJ_NOTHING,
+    OBJ_WALL,
+    OBJ_CUBE
+    };
+
     // ── State machine ──────────────────────────────────────────────────────
     enum State {
         ORIENT_INITIAL,         // Phase 0:  tourne sur soi-mêm pour trouver le fond
@@ -134,10 +149,20 @@ private:
         ID_TURN_RIGHT,          // rotate +90° from forward heading
         ID_SETTLE_RIGHT,        // short stabilization pause before right scan
         ID_DRIVE_TO_RIGHT_WALL, // drive until front sensor reading peaks → save right wall dist
+        ID_TURN_RIGHT_TO_CENTER,// rotate back 90° to face room center
+        ID_MEASURE_RIGHT_CENTER,// (settle step) prepare forward probe at right-center
+        ID_PROBE_RIGHT_CENTER,  // drive forward up to 2 m, record travelled = obstacle distance
+        ID_BACKUP_RIGHT_CENTER, // reverse exactly the probe distance to recover original spot
+        ID_TURN_RIGHT_TO_SCAN,  // rotate back to right scan heading before reverse
         ID_RETURN_FROM_RIGHT,   // drive backward until odometry shows we're back on yellow line
         ID_TURN_LEFT,           // rotate to face left (180° from right scan direction)
         ID_SETTLE_LEFT,         // short stabilization pause before left scan
         ID_DRIVE_TO_LEFT_WALL,  // drive until front sensor reading peaks → save left wall dist
+        ID_TURN_LEFT_TO_CENTER, // rotate back 90° to face room center
+        ID_MEASURE_LEFT_CENTER, // (settle step) prepare forward probe at left-center
+        ID_PROBE_LEFT_CENTER,   // drive forward up to 2 m, record travelled = obstacle distance
+        ID_BACKUP_LEFT_CENTER,  // reverse exactly the probe distance to recover original spot
+        ID_TURN_LEFT_TO_SCAN,   // rotate back to left scan heading before reverse
         ID_RETURN_FROM_LEFT,    // drive backward until odometry shows we're back on yellow line
         ID_FACE_FORWARD_AGAIN,  // rotate back to forward heading
         ID_CHECK_CUBE_AHEAD,    // if both sides "no wall" — drive forward, check for world-6 cube
@@ -157,6 +182,10 @@ private:
     double _orient_best_distance;   // distance libre maximale mesurée
     double _orient_start_theta;     // angle au début de la phase
     bool   _orient_initialized;     // flag pour init au 1er appel
+    double _right_wall_inner_sensor;
+    double _left_wall_inner_sensor;
+    bool _right_wall_sees_second_yellow_side;
+    bool _left_wall_sees_second_yellow_side;
 
     // Phase 1b sub-state: turn until wall is on right before following
     bool _corner_turning;
@@ -172,6 +201,8 @@ private:
     double _id_avg_r, _id_avg_g, _id_avg_b;  // separate channel averages (fog vs dark)
     double _id_right_wall_dist;     // meters traveled before right-side wall hit (or > timeout if none)
     double _id_left_wall_dist;      // meters traveled before left-side wall hit (or > timeout if none)
+    double _id_right_center_front;  // front sensor value after turning toward room center (right scan)
+    double _id_left_center_front;   // front sensor value after turning toward room center (left scan)
     bool   _id_right_wall_found;    // true if a wall stopped us within timeout
     bool   _id_left_wall_found;
     bool   _id_front_blocked_at_start;  // true → world 5 (obstacle on yellow line)
@@ -190,6 +221,29 @@ private:
     int    _id_front_hit_count;     // consecutive front-hit confirmations
     double _id_right_scan_left_peak; // peak LEFT side sensor while scanning right
     double _id_left_scan_right_peak; // peak RIGHT side sensor while scanning left
+    int _id_front_object_type;
+
+    DetectedObject _id_right_object;
+    DetectedObject _id_left_object;
+    DetectedObject _id_middle_object;
+
+    bool _id_cube_on_right;
+    bool _id_cube_on_left;
+
+    // Forward probe (taken while facing the room center after a side scan):
+    //   The IR sensors only see ~0.4 m, so a stationary reading at the center
+    //   never reports a wall that's 2-4 m away. We therefore drive forward up
+    //   to PROBE_FORWARD_MAX_M, recording the distance travelled before a hit.
+    //   Travel = PROBE_FORWARD_MAX_M  →  no obstacle ahead (open area).
+    //   Travel < ~0.7 m              →  obstacle very close (cube).
+    //   Travel ~ 0.7 .. 2.0 m        →  obstacle (wall) ahead.
+    double _id_probe_start_x;       // odometry x when the probe begins
+    double _id_probe_start_y;       // odometry y when the probe begins
+    double _id_probe_end_x;         // odometry x when the probe stops (used for backup)
+    double _id_probe_end_y;         // odometry y when the probe stops
+    int    _id_probe_steps;         // safety step counter for the probe
+    bool   _id_right_center_hit;    // true if probe at right-center hit something
+    bool   _id_left_center_hit;     // true if probe at left-center hit something
 
     // Phase 2+3 — world and waypoints
     int             _world_id;
@@ -238,6 +292,9 @@ private:
     bool   front_blocked();               // true if obstacle directly in front (world 6 check)
 
     const char* state_name();
+    const char* object_name(DetectedObject obj);
+
+
 };
 
 #endif

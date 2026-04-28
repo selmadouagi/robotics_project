@@ -45,6 +45,8 @@ MyRobot::MyRobot() : Robot()
     _id_avg_r = _id_avg_g = _id_avg_b = 0.0;
     _id_right_wall_dist   = 0.0;
     _id_left_wall_dist    = 0.0;
+    _id_right_center_front = 0.0;
+    _id_left_center_front  = 0.0;
     _id_right_wall_found  = false;
     _id_left_wall_found   = false;
     _id_front_blocked_at_start = false;
@@ -63,6 +65,24 @@ MyRobot::MyRobot() : Robot()
     _id_front_hit_count   = 0;
     _id_right_scan_left_peak = 0.0;
     _id_left_scan_right_peak = 0.0;
+    _id_probe_start_x = 0.0;
+    _id_probe_start_y = 0.0;
+    _id_probe_end_x   = 0.0;
+    _id_probe_end_y   = 0.0;
+    _id_probe_steps   = 0;
+    _id_right_center_hit = false;
+    _id_left_center_hit  = false;
+    _right_wall_inner_sensor = 0.0;
+    _left_wall_inner_sensor = 0.0;
+    _right_wall_sees_second_yellow_side = false;
+    _left_wall_sees_second_yellow_side = false;
+    _id_front_object_type = 0;
+    _id_right_object = OBJ_NOTHING;
+    _id_left_object = OBJ_NOTHING;
+    _id_middle_object = OBJ_NOTHING;
+
+    _id_cube_on_right = false;
+    _id_cube_on_left = false;
 
     _left_wheel_sensor  = getPositionSensor("left wheel sensor");
     _right_wheel_sensor = getPositionSensor("right wheel sensor");
@@ -116,6 +136,10 @@ void MyRobot::run()
     const double FORWARD_SPEED  = 4.0;
     const double ROT_SPEED      = 2.5;
     const double WALL_SPEED     = 4.5;
+    
+    // Fast speed only for identification rotations on the yellow line
+    const double ID_ROT_SPEED   = 5.0;    // Fast rotation speed during identification (rotations only)
+    const double ID_FORWARD_SPEED = 6.0;  // Fast straight motion during identification
 
     if (step(_time_step) == -1) return;
 
@@ -137,9 +161,12 @@ void MyRobot::run()
         compute_odometry();
         _theta = normalize_angle(get_heading_radians());
 
-        // GPS correction every ~5 s — low weight because resolution is 3 m
+        // GPS correction every ~5 s — low weight because resolution is 3 m.
+        // Disabled during Phase 2 because we depend on relative odometry
+        // (probe distances, backup distances) — a 3 m GPS jump breaks everything.
+        bool in_phase2 = (_state >= ID_FACE_FORWARD && _state <= ID_CLASSIFY);
         if (++_gps_timer >= 78) {
-            apply_gps_correction();
+            if (!in_phase2) apply_gps_correction();
             _gps_timer = 0;
         }
 
@@ -148,76 +175,8 @@ void MyRobot::run()
 
         switch (_state)
         {
-        // ── Phase 0: tourne sur soi-même pour trouver le fond de la salle ──
-        case ORIENT_INITIAL:
-        {
-            run_orient_initial();
-            break;
-        }
-
-        // ── Phase 1a: drive until a front wall is detected ────────────────
-        case LOCALIZE_FIND_WALL:
-        {
-            if (front > OBSTACLE_FRONT_THRESH) {
-                set_speed(0.0, 0.0);
-                _corner_turning = true;
-                _state = LOCALIZE_FOLLOW_CORNER;
-                cout << "[Phase1a] Wall found. Following to corner." << endl;
-            } else {
-                set_speed(FORWARD_SPEED, FORWARD_SPEED);
-            }
-            break;
-        }
-
-        // ── Phase 1b: follow right wall until a corner is reached ─────────
-        case LOCALIZE_FOLLOW_CORNER:
-        {
-            if (_corner_turning) {
-                // Turn left until front is clear AND right wall is in range
-                if (front < OBSTACLE_FRONT_THRESH && right > OBSTACLE_SIDE_THRESH) {
-                    _corner_turning = false;
-                    cout << "[Phase1b] Right wall acquired. Following." << endl;
-                } else {
-                    set_speed(-ROT_SPEED, ROT_SPEED);
-                }
-            } else {
-                if (front > OBSTACLE_FRONT_THRESH) {
-                    // Both front and right walls present → corner
-                    set_speed(0.0, 0.0);
-                    _state = LOCALIZE_ALIGN;
-                    cout << "[Phase1b] Corner reached. Aligning." << endl;
-                } else {
-                    // P-controller: maintain right wall at target reading
-                    // Target reading ~70 keeps a safe side distance; tune if needed
-                    double err = right - 70.0;
-                    double kp  = 0.03;
-                    set_speed(WALL_SPEED + kp * err, WALL_SPEED - kp * err);
-                }
-            }
-            break;
-        }
-
-        // ── Phase 1c: rotate to known heading then reset odometry ─────────
-        case LOCALIZE_ALIGN:
-        {
-            double err = normalize_angle(ALIGN_HEADING - _theta);
-            if (fabs(err) < ANGLE_TOL) {
-                set_speed(0.0, 0.0);
-                _x = 0.0;  _y = 0.0;  _theta = ALIGN_HEADING;
-                _origin_x = 0.0;  _origin_y = 0.0;
-                if (_left_wheel_sensor)  _prev_left_enc  = _left_wheel_sensor->getValue();
-                if (_right_wheel_sensor) _prev_right_enc = _right_wheel_sensor->getValue();
-                _state = IDENTIFY_WORLD;
-                cout << "[Phase1c] Aligned. Odometry reset to (0,0)." << endl;
-            } else {
-                double speed = (err > 0) ? ROT_SPEED : -ROT_SPEED;
-                set_speed(-speed, speed);
-            }
-            break;
-        }
-
         // ════════════════════════════════════════════════════════════════════
-        // ── Phase 2: WORLD IDENTIFICATION (rotate-and-scan, on yellow line) ─
+        // ──  Phase 2: WORLD IDENTIFICATION (rotate-and-scan, on yellow line) ─
         // Plan:
         //   2.1  Use compass to face forward (toward the far yellow line).
         //        Check front sensor BEFORE moving — if blocked, this is WORLD 5
@@ -237,7 +196,7 @@ void MyRobot::run()
         //   2.11 Classify (wall pattern + brightness + cube + start-front-blocked).
         // ════════════════════════════════════════════════════════════════════
 
-        // ── 2.1: rotate to forward heading ──────────────────────────────────
+        // 2.1: rotate to forward heading
         case ID_FACE_FORWARD:
         {
             if (!_id_initialized) {
@@ -254,7 +213,7 @@ void MyRobot::run()
                      << "  target θ=" << _id_forward_heading << endl;
             }
 
-            if (turn_to_heading(_id_forward_heading, ROT_SPEED)) {
+            if (turn_to_heading(_id_forward_heading, ID_ROT_SPEED+2.0)) {
                 cout << "[Phase2.1] Facing forward (θ=" << _theta << ")." << endl;
                 cout << "[Phase2.1] Front sensor at start = "
                      << front_obstacle() << "  (info only, world 5 ignored)" << endl;
@@ -265,7 +224,7 @@ void MyRobot::run()
             break;
         }
 
-        // ── 2.2: stationary camera brightness measurement ───────────────────
+        // 2.2: stationary camera brightness measurement
         case ID_MEASURE_LIGHT:
         {
             set_speed(0.0, 0.0);
@@ -277,15 +236,23 @@ void MyRobot::run()
             _id_wall_steps = 0;
             _id_right_scan_left_peak = 0.0;
             _id_left_scan_right_peak = 0.0;
+            _id_cube_on_left = false;
+            _id_left_object = OBJ_NOTHING;
+            _id_right_object = OBJ_NOTHING;
+            _id_middle_object = OBJ_NOTHING;
             _state = ID_TURN_RIGHT;
             break;
         }
 
-        // ── 2.3: turn 90° right (target heading = forward - π/2) ────────────
+        // 2.3: turn 90° right (target heading = forward - π/2)
         case ID_TURN_RIGHT:
         {
             double target = normalize_angle(_id_forward_heading - M_PI / 2.0);
-            if (turn_to_heading(target, ROT_SPEED)) {
+            double err = normalize_angle(target - _theta);
+            cout << "[DEBUG_TURN_R] forward_heading=" << _id_forward_heading
+                 << " target=" << target << " current_θ=" << _theta
+                 << " err=" << err << " |err|=" << fabs(err) << endl;
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
                 _id_scan_heading_target = target;
                 _id_settle_steps = 0;
                 cout << "[Phase2.3] Facing right (θ=" << _theta << "), settling." << endl;
@@ -294,14 +261,18 @@ void MyRobot::run()
             break;
         }
 
-        // ── settle after right turn to avoid recording while inertia still rotates
+        // 2.4a: settle after right turn to avoid recording while inertia still rotates
         case ID_SETTLE_RIGHT:
         {
             set_speed(0.0, 0.0);
             double err = normalize_angle(_id_scan_heading_target - _theta);
+            cout << "[SETTLE_RIGHT] target=" << _id_scan_heading_target << " theta=" << _theta
+                 << " err=" << err << " steps=" << _id_settle_steps << "/" << ID_ROT_SETTLE_STEPS << endl;
             if (fabs(err) > ANGLE_TOL) {
+                cout << "  --> returning to TURN_RIGHT (error too large)" << endl;
                 _state = ID_TURN_RIGHT;
             } else if (++_id_settle_steps >= ID_ROT_SETTLE_STEPS) {
+                cout << "  --> moving to DRIVE_TO_RIGHT_WALL" << endl;
                 _id_scan_start_x = _x;
                 _id_scan_start_y = _y;
                 _id_wall_steps   = 0;
@@ -311,12 +282,20 @@ void MyRobot::run()
             break;
         }
 
-        // ── 2.4: drive forward until front sensor sees wall, or timeout ─────
+        // 2.4b: drive forward until front sensor sees wall, or timeout
         case ID_DRIVE_TO_RIGHT_WALL:
         {
             _id_wall_steps++;
             double f = front_obstacle();
+            double side = right_obstacle();
             _id_right_scan_left_peak = max(_id_right_scan_left_peak, left_obstacle());
+            if (_id_wall_steps % 20 == 0) {
+                cout << "[DS_RIGHT]";
+                for (int i = 0; i < NUM_DS; ++i) {
+                    cout << " ds" << i << "=" << (_ds[i] ? _ds[i]->getValue() : -1);
+                }
+                cout << endl;
+            }
             double travelled = sqrt((_x - _id_scan_start_x) * (_x - _id_scan_start_x)
                                   + (_y - _id_scan_start_y) * (_y - _id_scan_start_y));
             double heading_err = normalize_angle(_id_scan_heading_target - _theta);
@@ -329,9 +308,7 @@ void MyRobot::run()
                 break;
             }
 
-            if (f > OBSTACLE_FRONT_HARD_STOP)
-                _id_front_hit_count = ID_FRONT_CONFIRM_STEPS;
-            else if (f > OBSTACLE_FRONT_THRESH)
+            if (f > OBSTACLE_FRONT_THRESH)
                 _id_front_hit_count++;
             else if (_id_front_hit_count > 0)
                 _id_front_hit_count--;
@@ -339,30 +316,178 @@ void MyRobot::run()
             if (_id_front_hit_count >= ID_FRONT_CONFIRM_STEPS) {
                 // Wall (or some obstacle) detected.
                 set_speed(0.0, 0.0);
+
                 _id_right_wall_dist  = travelled;
-                _id_right_wall_found = (travelled < WALL_FOUND_DIST_M)
-                                       ? true : true;  // any hit = wall here
+                _id_right_wall_found = true;
+                _id_right_object = OBJ_WALL;
+
                 cout << "[Phase2.4] Right scan: WALL at " << travelled << " m"
-                     << "  sensor=" << f
-                     << "  steps=" << _id_wall_steps << endl;
-                _state = ID_RETURN_FROM_RIGHT;
+                    << "  front=" << f
+                    << "  side=" << side
+                    << "  steps=" << _id_wall_steps << endl;
+
+                _id_settle_steps = 0;
+                _state = ID_TURN_RIGHT_TO_CENTER;
+              } else if (f > OBSTACLE_FRONT_HARD_STOP) {
+                set_speed(0.0, 0.0);
+                _id_right_wall_dist  = travelled;
+                 _id_right_wall_found = true;
+                 cout << "[Phase2.4] Right scan: FRONT wall stop (travelled " << travelled
+                     << " m, front=" << f << ", side=" << side << ")" << endl;
+                _id_settle_steps = 0;
+                _state = ID_TURN_RIGHT_TO_CENTER;
             } else if (_id_wall_steps > WALL_DRIVE_TIMEOUT) {
                 // Timed out without detecting anything → no wall on this side.
                 set_speed(0.0, 0.0);
                 _id_right_wall_dist  = travelled;
                 _id_right_wall_found = false;
+                _id_right_object = OBJ_NOTHING;
                 cout << "[Phase2.4] Right scan: NO WALL (travelled " << travelled
                      << " m, timeout)" << endl;
                 _state = ID_RETURN_FROM_RIGHT;
             } else {
-                double base = (f > OBSTACLE_FRONT_SLOW_THRESH) ? WALL_SPEED_SLOW : WALL_SPEED;
+                double base = (side > OBSTACLE_SIDE_THRESH) ? WALL_SPEED_SLOW : WALL_SPEED;
                 double corr = ID_HEADING_KP * heading_err;
                 set_speed(base - corr, base + corr);
             }
             break;
         }
 
-        // ── 2.5: reverse until odometry shows we're back on the yellow line ─
+        // 2.4c: turn back toward room center after right wall hit
+        case ID_TURN_RIGHT_TO_CENTER:
+        {
+            double target = _id_forward_heading;
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
+                _id_settle_steps = 0;
+                cout << "[Phase2.4b] Facing center from right wall (θ=" << _theta << ")" << endl;
+                _state = ID_MEASURE_RIGHT_CENTER;
+            }
+            break;
+        }
+
+        // 2.4d: kick off a forward probe toward room center (right side)
+        case ID_MEASURE_RIGHT_CENTER:
+        {
+            set_speed(0.0, 0.0);
+            if (++_id_settle_steps >= ID_ROT_SETTLE_STEPS) {
+                _id_probe_start_x = _x;
+                _id_probe_start_y = _y;
+                _id_probe_steps   = 0;
+                _id_front_hit_count = 0;
+                _id_right_center_hit  = false;
+                _id_right_center_front = 0.0;
+                cout << "[Phase2.4c] Starting forward probe (right side, max "
+                     << PROBE_FORWARD_MAX_M << " m)." << endl;
+                _state = ID_PROBE_RIGHT_CENTER;
+            }
+            break;
+        }
+
+            
+        // 2.4e-probe: drive forward up to 2 m, check if there is an obstacle
+        case ID_PROBE_RIGHT_CENTER:
+        {
+            _id_probe_steps++;
+            double f = front_obstacle();
+
+            cout << "[PROBE_RIGHT_CENTER_FRONT] "
+                << "ds0="  << (_ds[0]  ? _ds[0]->getValue()  : -1)
+                << " ds1=" << (_ds[1]  ? _ds[1]->getValue()  : -1)
+                << " ds14=" << (_ds[14] ? _ds[14]->getValue() : -1)
+                << " ds15=" << (_ds[15] ? _ds[15]->getValue() : -1)
+                << " front_max=" << f
+                << endl;
+
+            double travelled = sqrt((_x - _id_probe_start_x) * (_x - _id_probe_start_x)
+                                + (_y - _id_probe_start_y) * (_y - _id_probe_start_y));
+
+            if (f > OBSTACLE_FRONT_THRESH)
+                _id_front_hit_count++;
+            else if (_id_front_hit_count > 0)
+                _id_front_hit_count--;
+
+            if (_id_front_hit_count >= ID_FRONT_CONFIRM_STEPS || f > OBSTACLE_FRONT_HARD_STOP) {
+                set_speed(0.0, 0.0);
+
+                _id_right_center_hit = true;
+                _id_right_center_front = travelled;
+                _id_probe_end_x = _x;
+                _id_probe_end_y = _y;
+
+                if (travelled < 0.10 && f > 300) {
+                    cout << "[Phase2.4c-probe] Right-center: CUBE / obstacle tres proche detecte. "
+                        << "distance=" << travelled
+                        << " front=" << f << endl;
+
+                    _id_front_object_type = 2;
+                }
+                else {
+                    cout << "[Phase2.4c-probe] Right-center: WALL detected ahead. "
+                        << "distance=" << travelled
+                        << " front=" << f << endl;
+
+                    _id_front_object_type = 1;
+                }
+
+                _state = ID_BACKUP_RIGHT_CENTER;
+            }
+            else if (travelled > PROBE_FORWARD_MAX_M || _id_probe_steps > PROBE_FORWARD_TIMEOUT) {
+                set_speed(0.0, 0.0);
+
+                _id_right_center_hit = false;
+                _id_right_center_front = travelled;
+                _id_front_object_type = 0;
+
+                _id_probe_end_x = _x;
+                _id_probe_end_y = _y;
+
+                cout << "[Phase2.4c-probe] Right-center: NO obstacle in "
+                    << travelled << " m." << endl;
+
+                _state = ID_BACKUP_RIGHT_CENTER;
+            }
+            else {
+                set_speed(WALL_SPEED_SLOW, WALL_SPEED_SLOW);
+            }
+
+            break;
+        }
+
+        // 2.4f-backup: reverse the SAME distance we just travelled
+        // Measure distance from probe_end (where we stopped) and stop when it
+        // matches the forward probe distance. This is robust to GPS jumps and
+        // doesn't rely on absolute position being accurate.
+        case ID_BACKUP_RIGHT_CENTER:
+        {
+            double dx = _x - _id_probe_end_x;
+            double dy = _y - _id_probe_end_y;
+            double backed = sqrt(dx*dx + dy*dy);
+            double target = _id_right_center_front;  // forward probe distance
+
+            if (backed >= target - RETURN_TO_LINE_TOL_M) {
+                set_speed(0.0, 0.0);
+                cout << "[Phase2.4c-backup] Restored pre-probe position (backed "
+                     << backed << " m of " << target << " m)." << endl;
+                _state = ID_TURN_RIGHT_TO_SCAN;
+            } else {
+                set_speed(-WALL_SPEED_SLOW, -WALL_SPEED_SLOW);
+            }
+            break;
+        }
+
+        // 2.4g: turn back to right scan heading before reversing
+        case ID_TURN_RIGHT_TO_SCAN:
+        {
+            double target = _id_scan_heading_target; // right-facing heading
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
+                _id_settle_steps = 0;
+                cout << "[Phase2.4d] Facing right scan heading again (θ=" << _theta << ")" << endl;
+                _state = ID_RETURN_FROM_RIGHT;
+            }
+            break;
+        }
+
+        // 2.5: reverse until odometry shows we're back on the yellow line
         case ID_RETURN_FROM_RIGHT:
         {
             double dx = _x - _id_line_anchor_x;
@@ -376,16 +501,20 @@ void MyRobot::run()
             } else {
                 double heading_err = normalize_angle(_id_scan_heading_target - _theta);
                 double corr = ID_HEADING_KP * heading_err;
-                set_speed(-WALL_SPEED_SLOW - corr, -WALL_SPEED_SLOW + corr);
+                set_speed(-ID_FORWARD_SPEED - corr, -ID_FORWARD_SPEED + corr);
             }
             break;
         }
 
-        // ── 2.6: turn 180° to face the left side (forward + π/2) ────────────
+        // 2.6: turn 180° to face the left side (forward + π/2)
         case ID_TURN_LEFT:
         {
             double target = normalize_angle(_id_forward_heading + M_PI / 2.0);
-            if (turn_to_heading(target, ROT_SPEED)) {
+            double err = normalize_angle(target - _theta);
+            cout << "[DEBUG_TURN_L] forward_heading=" << _id_forward_heading
+                 << " target=" << target << " current_θ=" << _theta
+                 << " err=" << err << " |err|=" << fabs(err) << endl;
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
                 _id_scan_heading_target = target;
                 _id_settle_steps = 0;
                 cout << "[Phase2.6] Facing left (θ=" << _theta << "), settling." << endl;
@@ -394,14 +523,18 @@ void MyRobot::run()
             break;
         }
 
-        // ── settle after left turn to avoid recording while inertia still rotates
+        // 2.6b: settle after left turn to avoid recording while inertia still rotates
         case ID_SETTLE_LEFT:
         {
             set_speed(0.0, 0.0);
             double err = normalize_angle(_id_scan_heading_target - _theta);
+            cout << "[SETTLE_LEFT] target=" << _id_scan_heading_target << " theta=" << _theta
+                 << " err=" << err << " steps=" << _id_settle_steps << "/" << ID_ROT_SETTLE_STEPS << endl;
             if (fabs(err) > ANGLE_TOL) {
+                cout << "  --> returning to TURN_LEFT (error too large)" << endl;
                 _state = ID_TURN_LEFT;
             } else if (++_id_settle_steps >= ID_ROT_SETTLE_STEPS) {
+                cout << "  --> moving to DRIVE_TO_LEFT_WALL" << endl;
                 _id_scan_start_x = _x;
                 _id_scan_start_y = _y;
                 _id_wall_steps   = 0;
@@ -411,77 +544,274 @@ void MyRobot::run()
             break;
         }
 
-        // ── 2.7: drive forward until front sensor sees left wall, or timeout
+        // 2.7: drive forward until front sensor sees left wall, or timeout
         case ID_DRIVE_TO_LEFT_WALL:
         {
             _id_wall_steps++;
+
             double f = front_obstacle();
-            _id_left_scan_right_peak = max(_id_left_scan_right_peak, right_obstacle());
+            double side = left_obstacle();
+
+            // During the full drive toward the left wall, track the peak on the right side.
+            // While facing left, right-side sensors can still see central/left-side objects.
+            double left_scan_side_peak = 0.0;
+
+            // In left scans, the cube can appear on ds13, so include it as well.
+            if (_ds[13]) {
+                left_scan_side_peak = max(left_scan_side_peak, _ds[13]->getValue());
+            }
+
+            // Keep the standard right-side aggregate too, for robustness across worlds.
+            left_scan_side_peak = max(left_scan_side_peak, right_obstacle());
+
+            // Keep the highest side peak over the full trajectory.
+            _id_left_scan_right_peak = max(_id_left_scan_right_peak, left_scan_side_peak);
+
+            // If side peak is strong while front still does not see a wall,
+            // this is likely a side cube.
+            if (_id_left_scan_right_peak > ID_SIDE_OBS_CUBE_THRESH && f < OBSTACLE_FRONT_THRESH) {
+                _id_cube_on_left = true;
+                _id_left_object = OBJ_CUBE;
+            }
+
+            if (_id_wall_steps % 20 == 0) {
+                cout << "[DS_LEFT]";
+                for (int i = 0; i < NUM_DS; ++i) {
+                    cout << " ds" << i << "=" << (_ds[i] ? _ds[i]->getValue() : -1);
+                }
+                cout << endl;
+            }
+
             double travelled = sqrt((_x - _id_scan_start_x) * (_x - _id_scan_start_x)
-                                  + (_y - _id_scan_start_y) * (_y - _id_scan_start_y));
+                                + (_y - _id_scan_start_y) * (_y - _id_scan_start_y));
+
             double heading_err = normalize_angle(_id_scan_heading_target - _theta);
 
             if (fabs(heading_err) > ID_HEADING_DRIFT_ABORT) {
                 set_speed(0.0, 0.0);
                 cout << "[Phase2.7] Left scan drift (err=" << heading_err
-                     << "). Re-aligning." << endl;
+                    << "). Re-aligning." << endl;
                 _state = ID_TURN_LEFT;
                 break;
             }
 
-            if (f > OBSTACLE_FRONT_HARD_STOP)
-                _id_front_hit_count = ID_FRONT_CONFIRM_STEPS;
-            else if (f > OBSTACLE_FRONT_THRESH)
+            if (f > OBSTACLE_FRONT_THRESH)
                 _id_front_hit_count++;
             else if (_id_front_hit_count > 0)
                 _id_front_hit_count--;
 
             if (_id_front_hit_count >= ID_FRONT_CONFIRM_STEPS) {
+                // Wall detected.
                 set_speed(0.0, 0.0);
+
                 _id_left_wall_dist  = travelled;
                 _id_left_wall_found = true;
+
+                // If no cube was seen during the drive, the main left object is a wall.
+                if (!_id_cube_on_left) {
+                    _id_left_object = OBJ_WALL;
+                }
+
                 cout << "[Phase2.7] Left scan: WALL at " << travelled << " m"
-                     << "  sensor=" << f
-                     << "  steps=" << _id_wall_steps << endl;
-                _state = ID_RETURN_FROM_LEFT;
-            } else if (_id_wall_steps > WALL_DRIVE_TIMEOUT) {
+                    << "  front=" << f
+                    << "  side=" << side
+                    << "  peak_right=" << _id_left_scan_right_peak
+                    << "  object=" << object_name(_id_left_object)
+                    << "  steps=" << _id_wall_steps << endl;
+
+                _id_settle_steps = 0;
+                _state = ID_TURN_LEFT_TO_CENTER;
+            }
+            else if (f > OBSTACLE_FRONT_HARD_STOP) {
                 set_speed(0.0, 0.0);
+
+                _id_left_wall_dist  = travelled;
+                _id_left_wall_found = true;
+
+                // If no cube was seen during the drive, the main left object is a wall.
+                if (!_id_cube_on_left) {
+                    _id_left_object = OBJ_WALL;
+                }
+
+                cout << "[Phase2.7] Left scan: FRONT wall stop (travelled " << travelled
+                    << " m, front=" << f
+                    << ", side=" << side
+                    << ", peak_right=" << _id_left_scan_right_peak
+                    << ", object=" << object_name(_id_left_object)
+                    << ")" << endl;
+
+                _id_settle_steps = 0;
+                _state = ID_TURN_LEFT_TO_CENTER;
+            }
+            else if (_id_wall_steps > WALL_DRIVE_TIMEOUT) {
+                set_speed(0.0, 0.0);
+
                 _id_left_wall_dist  = travelled;
                 _id_left_wall_found = false;
+
+                // If no cube was seen and no wall was found, mark as empty.
+                if (!_id_cube_on_left) {
+                    _id_left_object = OBJ_NOTHING;
+                }
+
                 cout << "[Phase2.7] Left scan: NO WALL (travelled " << travelled
-                     << " m, timeout)" << endl;
+                    << " m, timeout)"
+                    << "  peak_right=" << _id_left_scan_right_peak
+                    << "  object=" << object_name(_id_left_object)
+                    << endl;
+
                 _state = ID_RETURN_FROM_LEFT;
-            } else {
-                double base = (f > OBSTACLE_FRONT_SLOW_THRESH) ? WALL_SPEED_SLOW : WALL_SPEED;
+            }
+            else {
+                double base = (side > OBSTACLE_SIDE_THRESH) ? WALL_SPEED_SLOW : WALL_SPEED;
                 double corr = ID_HEADING_KP * heading_err;
                 set_speed(base - corr, base + corr);
+            }
+
+            break;
+        }
+
+        // 2.7b: turn back toward room center after left wall hit
+        case ID_TURN_LEFT_TO_CENTER:
+        {
+            double target = _id_forward_heading;
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
+                _id_settle_steps = 0;
+                cout << "[Phase2.7b] Facing center from left wall (θ=" << _theta << ")" << endl;
+                _state = ID_MEASURE_LEFT_CENTER;
             }
             break;
         }
 
-        // ── 2.8: reverse back to yellow line ────────────────────────────────
+        // 2.7c: kick off a forward probe toward room center (left side)
+        case ID_MEASURE_LEFT_CENTER:
+        {
+            set_speed(0.0, 0.0);
+            if (++_id_settle_steps >= ID_ROT_SETTLE_STEPS) {
+                _id_probe_start_x = _x;
+                _id_probe_start_y = _y;
+                _id_probe_steps   = 0;
+                _id_front_hit_count = 0;
+                _id_left_center_hit  = false;
+                _id_left_center_front = 0.0;
+                cout << "[Phase2.7c] Starting forward probe (left side, max "
+                     << PROBE_FORWARD_MAX_M << " m)." << endl;
+                _state = ID_PROBE_LEFT_CENTER;
+            }
+            break;
+        }
+
+        // 2.7d-probe: drive forward up to 2 m, check if there is an obstacle
+        case ID_PROBE_LEFT_CENTER:
+        {
+            _id_probe_steps++;
+            double f = front_obstacle();
+            double travelled = sqrt((_x - _id_probe_start_x) * (_x - _id_probe_start_x)
+                                  + (_y - _id_probe_start_y) * (_y - _id_probe_start_y));
+
+            if (f > OBSTACLE_FRONT_THRESH)
+                _id_front_hit_count++;
+            else if (_id_front_hit_count > 0)
+                _id_front_hit_count--;
+
+            if (_id_front_hit_count >= ID_FRONT_CONFIRM_STEPS || f > OBSTACLE_FRONT_HARD_STOP) {
+                set_speed(0.0, 0.0);
+
+                _id_left_center_hit  = true;
+                _id_left_center_front = travelled;
+                _id_probe_end_x = _x;
+                _id_probe_end_y = _y;
+
+                // If we hit almost immediately after turning toward center,
+                // this is likely the same central cube/object seen in left scan.
+                if (travelled < 0.10) {
+                    _id_middle_object = OBJ_CUBE;
+                    cout << "[Phase2.7c-probe] Left-center: immediate HIT -> treated as CUBE "
+                        << "(dist=" << travelled << " m, front=" << f << ")" << endl;
+                } else {
+                    cout << "[Phase2.7c-probe] Left-center: HIT at "
+                        << travelled << " m (front=" << f << ")" << endl;
+                }
+
+                _state = ID_BACKUP_LEFT_CENTER;
+            } else if (travelled > PROBE_FORWARD_MAX_M || _id_probe_steps > PROBE_FORWARD_TIMEOUT) {
+                set_speed(0.0, 0.0);
+                _id_left_center_hit  = false;
+                _id_left_center_front = travelled;
+                _id_probe_end_x = _x;
+                _id_probe_end_y = _y;
+                cout << "[Phase2.7c-probe] Left-center: NO obstacle in "
+                     << travelled << " m." << endl;
+                _state = ID_BACKUP_LEFT_CENTER;
+            } else {
+                set_speed(WALL_SPEED_SLOW, WALL_SPEED_SLOW);
+            }
+            break;
+        }
+
+        // 2.7e-backup: reverse the SAME distance we just travelled
+        case ID_BACKUP_LEFT_CENTER:
+        {
+            double dx = _x - _id_probe_end_x;
+            double dy = _y - _id_probe_end_y;
+            double backed = sqrt(dx*dx + dy*dy);
+            double target = _id_left_center_front;
+
+            if (backed >= target - RETURN_TO_LINE_TOL_M) {
+                set_speed(0.0, 0.0);
+                cout << "[Phase2.7c-backup] Restored pre-probe position (backed "
+                     << backed << " m of " << target << " m)." << endl;
+                _state = ID_TURN_LEFT_TO_SCAN;
+            } else {
+                set_speed(-WALL_SPEED_SLOW, -WALL_SPEED_SLOW);
+            }
+            break;
+        }
+
+        // 2.7f: turn back to left scan heading before reversing
+        case ID_TURN_LEFT_TO_SCAN:
+        {
+            double target = _id_scan_heading_target; // left-facing heading
+            if (turn_to_heading(target, ID_ROT_SPEED+2.0)) {
+                _id_settle_steps = 0;
+                cout << "[Phase2.7d] Facing left scan heading again (θ=" << _theta << ")" << endl;
+                _state = ID_RETURN_FROM_LEFT;
+            }
+            break;
+        }
+
+        // 2.8: reverse back to yellow line
         case ID_RETURN_FROM_LEFT:
         {
-            double dx = _x - _id_line_anchor_x;
-            double dy = _y - _id_line_anchor_y;
-            double off_axis = sqrt(dx*dx + dy*dy);
+            // On return from the left wall, the main goal is to get back to yellow line.
+            // In these worlds, yellow line is close to y ≈ 0.
+            double off_line = fabs(_y - _id_line_anchor_y);
 
-            if (off_axis < RETURN_TO_LINE_TOL_M) {
+            // Safety: stop if we reached or crossed the yellow line.
+            // Returning from left wall, y decreases toward 0, then can go negative.
+            if (off_line < RETURN_TO_LINE_TOL_M || _y <= _id_line_anchor_y) {
                 set_speed(0.0, 0.0);
-                cout << "[Phase2.8] Back on yellow line (off=" << off_axis << " m)." << endl;
+
+                cout << "[Phase2.8] Back from left: back on yellow line"
+                    << " y=" << _y
+                    << " anchor_y=" << _id_line_anchor_y
+                    << " off_line=" << off_line
+                    << endl;
+
                 _state = ID_FACE_FORWARD_AGAIN;
             } else {
                 double heading_err = normalize_angle(_id_scan_heading_target - _theta);
                 double corr = ID_HEADING_KP * heading_err;
-                set_speed(-WALL_SPEED_SLOW - corr, -WALL_SPEED_SLOW + corr);
+                set_speed(-ID_FORWARD_SPEED - corr, -ID_FORWARD_SPEED + corr);
             }
+
             break;
         }
 
-        // ── 2.9: rotate back to forward heading ─────────────────────────────
+        // 2.9: rotate back to forward heading
         case ID_FACE_FORWARD_AGAIN:
         {
-            if (turn_to_heading(_id_forward_heading, ROT_SPEED)) {
+            if (turn_to_heading(_id_forward_heading, ID_ROT_SPEED+2.0)) {
                 cout << "[Phase2.9] Facing forward again (θ=" << _theta << ")." << endl;
 
                 // Cube probe is needed in two cases:
@@ -508,7 +838,7 @@ void MyRobot::run()
             break;
         }
 
-        // ── 2.10: drive forward briefly to detect the world-6 cube ──────────
+        // 2.10: drive forward briefly to detect the world-6 cube
         case ID_CHECK_CUBE_AHEAD:
         {
             _id_wall_steps++;
@@ -516,15 +846,17 @@ void MyRobot::run()
             double travelled = sqrt((_x - _id_scan_start_x) * (_x - _id_scan_start_x)
                                   + (_y - _id_scan_start_y) * (_y - _id_scan_start_y));
 
-            if (f > CUBE_DETECT_THRESH) {
+            if (f > CUBE_DETECT_THRESH && travelled <= CUBE_MAX_DIST_M) {
                 set_speed(0.0, 0.0);
                 _id_cube_ahead = true;
+                _id_middle_object = OBJ_CUBE;
                 cout << "[Phase2.10] CUBE detected ahead at " << travelled
                      << " m (sensor=" << f << ")." << endl;
                 _state = ID_CLASSIFY;
             } else if (_id_wall_steps > CUBE_CHECK_STEPS) {
                 set_speed(0.0, 0.0);
                 _id_cube_ahead = false;
+                _id_middle_object = OBJ_NOTHING;
                 cout << "[Phase2.10] No cube ahead within " << travelled
                      << " m." << endl;
                 _state = ID_CLASSIFY;
@@ -534,9 +866,21 @@ void MyRobot::run()
             break;
         }
 
-        // ── 2.11: classify based on saved measurements ──────────────────────
+        // 2.11: classify based on saved measurements
         case ID_CLASSIFY:
         {
+            bool sidePeakSig = (_id_right_scan_left_peak > 250.0 || _id_left_scan_right_peak > 250.0);
+            
+            bool cube_detected =
+                _id_cube_ahead ||
+                (_id_middle_object == OBJ_CUBE) ||
+                sidePeakSig;
+
+            if (cube_detected) {
+                _id_cube_ahead = true;
+                _id_middle_object = OBJ_CUBE;
+            }
+
             set_speed(0.0, 0.0);
 
             cout << "════════════════════════════════════════════════════════" << endl;
@@ -544,13 +888,19 @@ void MyRobot::run()
             cout << "  brightness     = " << _id_brightness          << endl;
             cout << "  R/G/B          = " << _id_avg_r << " / " << _id_avg_g << " / " << _id_avg_b << endl;
             cout << "  right wall     = " << (_id_right_wall_found ? "YES" : "NO ")
-                 << "  (dist=" << _id_right_wall_dist << " m)" << endl;
+                << "  (dist=" << _id_right_wall_dist << " m)" << endl;
             cout << "  left  wall     = " << (_id_left_wall_found  ? "YES" : "NO ")
-                 << "  (dist=" << _id_left_wall_dist  << " m)" << endl;
+                << "  (dist=" << _id_left_wall_dist  << " m)" << endl;
+            cout << "  R-center probe = " << (_id_right_center_hit ? "HIT " : "open")
+                << "  (forward dist=" << _id_right_center_front << " m)" << endl;
+            cout << "  L-center probe = " << (_id_left_center_hit  ? "HIT " : "open")
+                << "  (forward dist=" << _id_left_center_front  << " m)" << endl;
             cout << "  front blocked  = " << (_id_front_blocked_at_start ? "YES" : "NO") << endl;
-            cout << "  cube ahead     = " << (_id_cube_ahead ? "YES" : "NO") << endl;
-              cout << "  side peaks(L/R)= " << _id_right_scan_left_peak
-                  << " / " << _id_left_scan_right_peak << endl;
+            cout << "  cube detected  = " << (cube_detected ? "YES" : "NO") << endl;
+            cout << "  cube ahead raw = " << (_id_cube_ahead ? "YES" : "NO") << endl;
+            cout << "  side peaks(Rscan-left / Lscan-right)= "
+                << _id_right_scan_left_peak
+                << " / " << _id_left_scan_right_peak << endl;
             cout << "════════════════════════════════════════════════════════" << endl;
 
             _world_id = classify_world_full();
@@ -562,9 +912,6 @@ void MyRobot::run()
             break;
         }
 
-        // ════════════════════════════════════════════════════════════════════
-        // ── Legacy single-snapshot identifier (kept as fallback) ────────────
-        // ════════════════════════════════════════════════════════════════════
         case IDENTIFY_WORLD:
         {
             set_speed(0.0, 0.0);
@@ -881,116 +1228,100 @@ bool MyRobot::front_blocked()
     return front_obstacle() > OBSTACLE_FRONT_THRESH;
 }
 
-//////////////////////////////////////////////
 
+//////////////////////////////////////////////
 int MyRobot::classify_world_full()
 {
-    // ── Strategy: decision tree on the wall pattern (per Elizabeth's table) ─
-    // World 5 is intentionally not handled here (will be detected as a runtime
-    // obstacle during navigation, not during identification).
-    //
-    //   World | Left      | Right    | Tiebreaker
-    //     1   | wall      | wall     | bright (no fog)
-    //     2   | cubes     | wall     | very dark
-    //     3   | cubes     | wall     | dark + fog
-    //     4   | wall      | no wall  | dim/foggy
-    //     6   | no wall   | no wall  | cube ahead
-    //     7   | no wall   | no wall  | no cube
-    //     8   | no wall   | wall     | bright
-    //     9   | wall      | wall     | medium light + fog
-    //    10   | wall      | no wall  | bright
-    //
-    // First-cut decision: classify each side as wall or no-wall based on
-    // whether the robot stopped on a sensor hit before timing out.
-    //
-    // Cubes (world 2 & 3 left side) read as "wall" (a hit happened) — they are
-    // disambiguated from real walls by the very-dark camera signature (world 2)
-    // or the fog signature (world 3).
-    // ─────────────────────────────────────────────────────────────────────────
-
     bool L = _id_left_wall_found;
     bool R = _id_right_wall_found;
-    double b = _id_brightness;
+
+    bool obstacle_from_right = _id_right_center_hit;
+    bool obstacle_from_left  = _id_left_center_hit;
+
     double side_diff = fabs(_id_left_wall_dist - _id_right_wall_dist);
-    double side_peak_max = max(_id_right_scan_left_peak, _id_left_scan_right_peak);
-    bool side_cube_signature = (_id_right_scan_left_peak > ID_SIDE_OBS_CUBE_THRESH) ||
-                               (_id_left_scan_right_peak > ID_SIDE_OBS_CUBE_THRESH);
 
-    // Saturation = max channel - min channel. Low saturation + non-trivial
-    // brightness → grayscale → fog.
-    double mx = std::max(_id_avg_r, std::max(_id_avg_g, _id_avg_b));
-    double mn = std::min(_id_avg_r, std::min(_id_avg_g, _id_avg_b));
-    double saturation = mx - mn;
-    bool is_foggy = (b > 5.0) && (saturation < 12.0);
+    bool side_cube_signature =
+        (_id_right_scan_left_peak > ID_SIDE_OBS_CUBE_THRESH) ||
+        (_id_left_scan_right_peak  > ID_SIDE_OBS_CUBE_THRESH);
 
-    cout << "[Classify] b=" << b << " sat=" << saturation
+    bool cube_detected =
+        _id_cube_ahead ||
+        (_id_middle_object == OBJ_CUBE) ||
+        side_cube_signature;
+
+    double maxRGB = std::max(_id_avg_r, std::max(_id_avg_g, _id_avg_b));
+    double minRGB = std::min(_id_avg_r, std::min(_id_avg_g, _id_avg_b));
+    double saturation = maxRGB - minRGB;
+
+    bool is_foggy =
+        (_id_avg_b > 100.0 &&
+         _id_avg_g > 100.0 &&
+         _id_avg_r < 95.0 &&
+         fabs(_id_avg_g - _id_avg_b) < 25.0);
+
+    cout << "[Classify] "
+         << "R_center=" << (obstacle_from_right ? "HIT" : "OPEN")
+         << " distR=" << _id_right_center_front
+         << " | L_center=" << (obstacle_from_left ? "HIT" : "OPEN")
+         << " distL=" << _id_left_center_front
+         << " R=" << _id_avg_r
+         << " G=" << _id_avg_g
+         << " B=" << _id_avg_b
+         << " sat=" << saturation
          << " foggy=" << is_foggy
-         << " L=" << (L?"WALL":"NO ") << " R=" << (R?"WALL":"NO ")
-            << " dL=" << _id_left_wall_dist << " dR=" << _id_right_wall_dist
-            << " dDiff=" << side_diff
-            << " sidePeakSig=" << (side_cube_signature ? "YES" : "NO")
-         << " cube=" << (_id_cube_ahead ? "YES" : "NO") << endl;
+         << " L=" << (L ? "WALL" : "NO")
+         << " R=" << (R ? "WALL" : "NO")
+         << " dDiff=" << side_diff
+         << " sidePeakSig=" << (side_cube_signature ? "YES" : "NO")
+         << " cube=" << (cube_detected ? "YES" : "NO")
+         << endl;
 
-    // ── Both sides clear → world 6 or 7, decided by cube check ─────────────
-    if (!L && !R) {
-        return _id_cube_ahead ? 6 : 7;
+    if (_id_brightness >= 86 && _id_brightness < 88) {
+        return 5;
+    }
+    if (!obstacle_from_right && obstacle_from_left) {
+        cout << "[Classify] Signature: right center OPEN, left center HIT." << endl;
+        if (_id_brightness <= 80){
+            return 10;
+        }
+        else { return 4;}
+
     }
 
-    // ── Left wall, right clear → world 4 or 10, decided by brightness ──────
-    if (L && !R) {
-        if (b >= BRIGHT_MIN) return 10;   // bright = world 10
-        return 4;                         // dimmer + foggy = world 4
-    }
-
-    // ── Right wall, left clear → world 8 (only candidate) ──────────────────
-    if (!L && R) {
+    // Inverse du cas précédent
+    if (obstacle_from_right && !obstacle_from_left) {
+        cout << "[Classify] Signature: right center HIT, left center OPEN." << endl;
         return 8;
     }
 
-    // ── Both sides have something (wall OR cubes) → worlds 1, 2, 3, 9 ──────
-    // Worlds 2/3 include a cube ahead (closer than side walls). We rely on the
-    // explicit front cube probe instead of brightness-only thresholds.
-    // Guard: only trust this branch for dark scenes. In bright scenes, occasional
-    // front echoes can falsely report a cube.
-    if (L && R && _id_cube_ahead && b < MEDIUM_MIN) {
-        return is_foggy ? 3 : 2;
-    }
+    // Les deux côtés vers le centre sont libres
+    if (!obstacle_from_right && !obstacle_from_left) {
+        cout << "[Classify] Signature: both center probes OPEN." << endl;
 
-    // If side distances are asymmetric but no front cube was found, this is
-    // likely just an off-center start in a wall+wall world (1 or 9).
-    if (side_diff > 1.0 && !_id_cube_ahead) {
-        // In some maps, world 2/3 may not trigger front-cube probe reliably,
-        // but still produce very strong side echoes during scan due to cubes.
-        if (side_cube_signature) {
-            // Bright runs with very strong side peaks are typically world 3 in
-            // this map set. Avoid forcing them to world 2.
-            if (b >= BRIGHT_MIN && side_peak_max >= ID_SIDE_OBS_VERY_STRONG) {
-                return 3;
-            }
-            return is_foggy ? 3 : 2;
+        if (_id_brightness <= 100){ 
+            return 7;
         }
-        if (b >= BRIGHT_MIN) return 1;
-        if (b >= MEDIUM_MIN) return 9;
-        return 9;
-    }
 
-    // Discriminate by brightness:
-    //   World 2: very dark         (b < DARK_MIN)
-    //   World 1: bright, no fog    (b >= BRIGHT_MIN, low saturation? actually high R/G/B)
-    //   World 9: medium + fog      (MEDIUM_MIN <= b < BRIGHT_MIN, foggy)
-    //   World 3: dark + fog        (b < MEDIUM_MIN, foggy)
-    if (b < DARK_MIN) {
-        return 2;                   // very dark → world 2
+        return 6;
     }
-    if (b >= BRIGHT_MIN) {
-        return 1;                   // bright → world 1
+    
+    if (obstacle_from_right && obstacle_from_left) {
+        if (_id_cube_on_left) {
+            if (_id_brightness <= 100){ 
+            return 2;
+            }
+            else{
+                return 3; }
+        } else {
+            if (_id_brightness <= 60){ 
+            return 9;   
+            }
+            else{
+                return 1;}
+        }
     }
-    if (b >= MEDIUM_MIN) {
-        return 9;                   // medium light → world 9
-    }
-    return 3;                       // dark + fog → world 3
+    return -1;
 }
-
 //////////////////////////////////////////////
 
 void MyRobot::load_waypoints(int world_id)
@@ -1094,6 +1425,7 @@ bool MyRobot::turn_to_heading(double target, double max_speed)
     double err = normalize_angle(target - _theta);
     if (fabs(err) < ANGLE_TOL) {
         set_speed(0.0, 0.0);
+        cout << "[turn_to_heading DEBUG] REACHED target=" << target << " theta=" << _theta << " err=" << err << endl;
         return true;
     }
 
@@ -1102,6 +1434,8 @@ bool MyRobot::turn_to_heading(double target, double max_speed)
     if (speed > max_speed) speed = max_speed;
     if (err < 0.0) speed = -speed;
 
+    cout << "[turn_to_heading DEBUG] TURNING target=" << target << " theta=" << _theta 
+         << " err=" << err << " speed=" << speed << endl;
     set_speed(-speed, speed);
     return false;
 }
@@ -1146,24 +1480,49 @@ double MyRobot::front_obstacle()
 
 double MyRobot::left_obstacle()
 {
-    double max_val = 0.0;
-    int ids[] = {2, 3, 4, 5};
-    for (int i = 0; i < 4; i++)
-        if (_ds[ids[i]] && _ds[ids[i]]->getValue() > max_val)
-            max_val = _ds[ids[i]]->getValue();
-    return max_val;
+    int ids[] = {4, 5, 6};
+    vector<double> values;
+    values.reserve(3);
+
+    for (int i = 0; i < 3; ++i) {
+        if (_ds[ids[i]])
+            values.push_back(_ds[ids[i]]->getValue());
+    }
+
+    if (values.empty())
+        return 0.0;
+
+    sort(values.begin(), values.end());
+    return values[values.size() / 2];
 }
 
 //////////////////////////////////////////////
 
 double MyRobot::right_obstacle()
 {
-    double max_val = 0.0;
-    int ids[] = {10, 11, 12, 13};
-    for (int i = 0; i < 4; i++)
-        if (_ds[ids[i]] && _ds[ids[i]]->getValue() > max_val)
-            max_val = _ds[ids[i]]->getValue();
-    return max_val;
+    int ids[] = {9, 10, 11};
+    vector<double> values;
+    values.reserve(3);
+
+    for (int i = 0; i < 3; ++i) {
+        if (_ds[ids[i]])
+            values.push_back(_ds[ids[i]]->getValue());
+    }
+
+    if (values.empty()) {
+        cout << "[right_obstacle] NO SENSORS!" << endl;
+        return 0.0;
+    }
+
+    sort(values.begin(), values.end());
+    double median = values[values.size() / 2];
+    if (_state == ID_DRIVE_TO_RIGHT_WALL || _state == ID_TURN_RIGHT) {
+        cout << "[right_obstacle] ds[9]=" << (_ds[9] ? _ds[9]->getValue() : -1)
+             << " ds[10]=" << (_ds[10] ? _ds[10]->getValue() : -1)
+             << " ds[11]=" << (_ds[11] ? _ds[11]->getValue() : -1)
+             << " median=" << median << endl;
+    }
+    return median;
 }
 
 //////////////////////////////////////////////
@@ -1194,10 +1553,20 @@ const char* MyRobot::state_name()
         case ID_TURN_RIGHT:          return "ID_TURN_R";
         case ID_SETTLE_RIGHT:        return "ID_SETTLE_R";
         case ID_DRIVE_TO_RIGHT_WALL: return "ID_SCAN_R";
+        case ID_TURN_RIGHT_TO_CENTER:return "ID_TURN_R_C";
+        case ID_MEASURE_RIGHT_CENTER:return "ID_MEAS_R_C";
+        case ID_PROBE_RIGHT_CENTER:  return "ID_PROBE_R_C";
+        case ID_BACKUP_RIGHT_CENTER: return "ID_BACK_R_C";
+        case ID_TURN_RIGHT_TO_SCAN:  return "ID_TURN_R_S";
         case ID_RETURN_FROM_RIGHT:   return "ID_BACK_R";
         case ID_TURN_LEFT:           return "ID_TURN_L";
         case ID_SETTLE_LEFT:         return "ID_SETTLE_L";
         case ID_DRIVE_TO_LEFT_WALL:  return "ID_SCAN_L";
+        case ID_TURN_LEFT_TO_CENTER: return "ID_TURN_L_C";
+        case ID_MEASURE_LEFT_CENTER: return "ID_MEAS_L_C";
+        case ID_PROBE_LEFT_CENTER:   return "ID_PROBE_L_C";
+        case ID_BACKUP_LEFT_CENTER:  return "ID_BACK_L_C";
+        case ID_TURN_LEFT_TO_SCAN:   return "ID_TURN_L_S";
         case ID_RETURN_FROM_LEFT:    return "ID_BACK_L";
         case ID_FACE_FORWARD_AGAIN:  return "ID_FACE_FWD2";
         case ID_CHECK_CUBE_AHEAD:    return "ID_CUBE";
@@ -1227,7 +1596,15 @@ double MyRobot::measure_forward_distance()
     return 1024.0 - max_obstacle;
 }
 
-
+const char* MyRobot::object_name(DetectedObject obj)
+{
+    switch (obj) {
+        case OBJ_WALL:    return "WALL";
+        case OBJ_CUBE:    return "CUBE";
+        case OBJ_NOTHING: return "NOTHING";
+        default:          return "UNKNOWN";
+    }
+}
 
 void MyRobot::run_orient_initial()
 {

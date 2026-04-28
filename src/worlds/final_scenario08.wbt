@@ -8,8 +8,8 @@ WorldInfo {
   title "Pioneer 2"
 }
 Viewpoint {
-  orientation -0.49163344133043313 -0.6810195818429402 -0.5426867314685909 1.8959917
-  position -5.6366733 29.644519 2.9629915
+  orientation 0.04158978085561542 -0.8447415568505401 -0.5335559879320142 3.137476345694144
+  position 0.1979596033017905 15.062460322509658 -15.251015683063176
 }
 Background {
   skyColor [
@@ -1398,7 +1398,7 @@ DEF FLOOR Solid {
   locked TRUE
 }
 Pioneer2_final {
-  translation 0 0 -9.05
+  translation -0.00168818 0 -7.99
   rotation 0 1 0 3.14
   controller "yay"
   extensionSlot [
