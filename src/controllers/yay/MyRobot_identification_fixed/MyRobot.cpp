@@ -16,15 +16,20 @@ MyRobot::MyRobot() : Robot()
 
     _left_speed = _right_speed = 0.0;
     _x = _y = _theta = 0.0;
+    _sr = _sl = 0.0;
     _prev_left_enc = _prev_right_enc = 0.0;
+    _origin_x = _origin_y = 0.0;
 
     // Start directly in world identification.
     _state          = ID_FACE_FORWARD;
     _victims_found  = 0;
+    _spin_total     = 0.0;
     _state_after_spin = FOLLOW_PATH;
+    _ignore_detection_steps = 0;
     _world_id       = 0;
     _current_wp     = 0;
     _gps_timer      = 0;
+    _avoid_steps    = 0;
 
     // Phase 2 — world identification fields
     _id_brightness        = 0.0;
@@ -59,8 +64,6 @@ MyRobot::MyRobot() : Robot()
     _id_left_center_hit  = false;
     _id_left_object = OBJ_NOTHING;
     _id_middle_object = OBJ_NOTHING;
-    _stuck_ticks = 0;
-    _last_dist_to_wp = 1e9;
 
     _id_cube_on_left = false;
 
@@ -123,8 +126,8 @@ void MyRobot::run()
         _y = (float)_my_gps->getValues()[0];   // Webots X → our y (lateral)
     }
     _theta = normalize_angle(get_heading_radians());
-    _start_x = _x;
-    _start_y = _y;
+    _origin_x = _x;
+    _origin_y = _y;
     if (_left_wheel_sensor)  _prev_left_enc  = _left_wheel_sensor->getValue();
     if (_right_wheel_sensor) _prev_right_enc = _right_wheel_sensor->getValue();
     cout << "GPS: x=" << _x << " y=" << _y << " θ=" << _theta << endl;
@@ -203,11 +206,31 @@ void MyRobot::run()
                  << "  R=" << _id_avg_r
                  << "  G=" << _id_avg_g
                  << "  B=" << _id_avg_b << endl;
+
             _id_wall_steps = 0;
             _id_right_scan_left_peak = 0.0;
             _id_left_scan_right_peak = 0.0;
             _id_left_object = OBJ_NOTHING;
             _id_middle_object = OBJ_NOTHING;
+            _id_right_object = OBJ_NOTHING;
+
+            // If the light/color uniquely identifies the world, skip the right/left wall scan.
+            // This does NOT touch turn_to_heading().
+            int light_world = classify_world_by_light_only();
+            if (light_world != -1) {
+                _world_id = light_world;
+                cout << "[Phase2.2] Light-only identification: WORLD "
+                     << _world_id
+                     << " -> skipping right/left wall discovery." << endl;
+
+                load_path_for_world(_world_id);
+                _current_wp = 0;
+                _state = INITIAL_TURN;
+                break;
+            }
+
+            // Ambiguous light: keep the existing wall discovery logic.
+            cout << "[Phase2.2] Light ambiguous -> continuing wall discovery." << endl;
             _state = ID_TURN_RIGHT;
             break;
         }
@@ -889,69 +912,185 @@ void MyRobot::run()
              << " x=" << _x << " y=" << _y << " θ=" << _theta
              << " front=" << front << " right=" << right
              << " victims=" << _victims_found
-             << " current_wp=" << _current_wp
-             << " return_wp=" << _return_wp
-             << " path_size=" << _path.size()
+             << " wp=" << _current_wp << "/" << _waypoints.size()
              << endl;
     }
 
     set_speed(0.0, 0.0);
     
 }
-
-
-
-
-
-//////////////////////////////////////////////
-// Phase 2 helpers: world identification
 //////////////////////////////////////////////
 
-void MyRobot::measure_camera_brightness()
+void MyRobot::start_spin(State next_state)
 {
-    _id_brightness = 0.0;
-    _id_avg_r = _id_avg_g = _id_avg_b = 0.0;
-
-    Camera* cam = _forward_camera ? _forward_camera : _spherical_camera;
-    if (!cam) return;
-
-    const unsigned char* img = cam->getImage();
-    if (!img) return;
-
-    int width  = cam->getWidth();
-    int height = cam->getHeight();
-    if (width <= 0 || height <= 0) return;
-
-    // Use the central part of the image to avoid noisy borders.
-    int x0 = width / 4;
-    int x1 = (3 * width) / 4;
-    int y0 = height / 4;
-    int y1 = (3 * height) / 4;
-
-    double sum_r = 0.0;
-    double sum_g = 0.0;
-    double sum_b = 0.0;
-    int count = 0;
-
-    for (int y = y0; y < y1; ++y) {
-        for (int x = x0; x < x1; ++x) {
-            sum_r += Camera::imageGetRed(img, width, x, y);
-            sum_g += Camera::imageGetGreen(img, width, x, y);
-            sum_b += Camera::imageGetBlue(img, width, x, y);
-            ++count;
-        }
-    }
-
-    if (count == 0) return;
-
-    _id_avg_r = sum_r / count;
-    _id_avg_g = sum_g / count;
-    _id_avg_b = sum_b / count;
-    _id_brightness = (_id_avg_r + _id_avg_g + _id_avg_b) / 3.0;
+    _state_after_spin = next_state;
+    _spin_total       = 0.0;
+    _state = SPIN_VICTIM;
 }
 
 //////////////////////////////////////////////
 
+bool MyRobot::detect_green_victim()
+{
+    if (!_forward_camera) return false;
+    const unsigned char* img = _forward_camera->getImage();
+    if (!img) return false;
+
+    int width  = _forward_camera->getWidth();
+    int height = _forward_camera->getHeight();
+    int total  = width * height;
+    int green_count = 0;
+
+    unsigned char r, g, b;
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            r = _forward_camera->imageGetRed(img,   width, x, y);
+            g = _forward_camera->imageGetGreen(img, width, x, y);
+            b = _forward_camera->imageGetBlue(img,  width, x, y);
+            // Relative dominance works under fog: G must beat R and B by a margin,
+            // not just undercut an absolute ceiling that fog can push everything below.
+            if (g > GREEN_MIN_G && g > (int)r + GREEN_DOMINANCE && g > (int)b + GREEN_DOMINANCE)
+                green_count++;
+        }
+    }
+
+    return (double)green_count / total >= GREEN_RATIO_THRESH;
+}
+
+void MyRobot::victim_position_in_image(double& ratio, double& center_x)
+{
+    ratio = 0.0;
+    center_x = 0.0;
+    if (!_forward_camera) return;
+    const unsigned char* img = _forward_camera->getImage();
+    if (!img) return;
+
+    int width  = _forward_camera->getWidth();
+    int height = _forward_camera->getHeight();
+    int total  = width * height;
+    int green_count = 0;
+    long sum_x = 0;
+
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            unsigned char r = _forward_camera->imageGetRed(img,   width, x, y);
+            unsigned char g = _forward_camera->imageGetGreen(img, width, x, y);
+            unsigned char b = _forward_camera->imageGetBlue(img,  width, x, y);
+            if (g > GREEN_MIN_G && g > (int)r + GREEN_DOMINANCE && g > (int)b + GREEN_DOMINANCE) {
+                green_count++;
+                sum_x += x;
+            }
+        }
+    }
+
+    ratio = (double)green_count / total;
+    if (green_count > 0) {
+        double avg_x = (double)sum_x / green_count;
+        center_x = (avg_x / width) * 2.0 - 1.0;
+    }
+}
+
+//////////////////////////////////////////////
+
+int MyRobot::classify_world()
+{
+    if (!_forward_camera) return 0;
+    const unsigned char* img = _forward_camera->getImage();
+    if (!img) return 0;
+
+    int width  = _forward_camera->getWidth();
+    int height = _forward_camera->getHeight();
+    int total  = width * height;
+    long brightness = 0;
+
+    unsigned char r, g, b;
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            r = _forward_camera->imageGetRed(img,   width, x, y);
+            g = _forward_camera->imageGetGreen(img, width, x, y);
+            b = _forward_camera->imageGetBlue(img,  width, x, y);
+            brightness += (r + g + b) / 3;
+        }
+    }
+
+    double avg = (double)brightness / total;
+    // Fog worlds are significantly darker; threshold may need tuning
+    return (avg < 100) ? 1 : 0;
+}
+
+//////////////////////////////////////////////
+// ── Phase 2 helpers ──────────────────────────────────────────────────────
+
+void MyRobot::measure_camera_brightness()
+{
+    _id_brightness = _id_avg_r = _id_avg_g = _id_avg_b = 0.0;
+    if (!_forward_camera) return;
+    const unsigned char* img = _forward_camera->getImage();
+    if (!img) return;
+
+    int width  = _forward_camera->getWidth();
+    int height = _forward_camera->getHeight();
+    long total = (long)width * (long)height;
+    if (total <= 0) return;
+
+    long sum_r = 0, sum_g = 0, sum_b = 0;
+    for (int x = 0; x < width; x++) {
+        for (int y = 0; y < height; y++) {
+            sum_r += _forward_camera->imageGetRed  (img, width, x, y);
+            sum_g += _forward_camera->imageGetGreen(img, width, x, y);
+            sum_b += _forward_camera->imageGetBlue (img, width, x, y);
+        }
+    }
+
+    _id_avg_r = (double)sum_r / total;
+    _id_avg_g = (double)sum_g / total;
+    _id_avg_b = (double)sum_b / total;
+    _id_brightness = (_id_avg_r + _id_avg_g + _id_avg_b) / 3.0;
+}
+
+//////////////////////////////////////////////
+int MyRobot::classify_world_by_light_only()
+{
+    /*
+      Returns a world number when the center camera color is specific enough.
+      Returns -1 when the color is ambiguous, so the normal right/left wall scan continues.
+    */
+
+    double R = _id_avg_r;
+    double G = _id_avg_g;
+    double B = _id_avg_b;
+    double bright = _id_brightness;
+
+    // World 9: very bright cyan/white-blue signature.
+    if (R >= 155.0 && R <= 175.0 &&
+        G >= 235.0 && G <= 260.0 &&
+        B >= 235.0 && B <= 260.0) {
+        return 9;
+    }
+
+    // World 3: medium cyan/blue signature.
+    if (R >= 55.0 && R <= 70.0 &&
+        G >= 135.0 && G <= 165.0 &&
+        B >= 135.0 && B <= 165.0) {
+        return 3;
+    }
+
+    // World 2: lighter cyan signature.
+    if (R >= 80.0 && R <= 95.0 &&
+        G >= 175.0 && G <= 205.0 &&
+        B >= 175.0 && B <= 205.0) {
+        return 2;
+    }
+
+    // World 5: your previous special brightness signature.
+    if (bright >= 86.0 && bright <= 88.5) {
+        return 5;
+    }
+
+    return -1;
+}
+
+//////////////////////////////////////////////
 int MyRobot::classify_world_full()
 {
     bool L = _id_left_wall_found;
@@ -998,61 +1137,83 @@ int MyRobot::classify_world_full()
          << " cube=" << (cube_detected ? "YES" : "NO")
          << endl;
 
-    if (_id_brightness >= 84.0 && _id_brightness < 88.5 &&
-        _id_avg_r >= 40.0 && _id_avg_r <= 55.0 &&
-        _id_avg_g >= 95.0 && _id_avg_g <= 115.0 &&
-        _id_avg_b >= 95.0 && _id_avg_b <= 115.0 &&
-        is_foggy) {
-        cout << "[Classify] Direct light/color signature => WORLD 5" << endl;
+    if (_id_brightness >= 86 && _id_brightness < 88) {
         return 5;
-    }   
-
+    }
     if (!obstacle_from_right && obstacle_from_left) {
         cout << "[Classify] Signature: right center OPEN, left center HIT." << endl;
-
-        if (_id_brightness <= 80) {
+        if (_id_brightness <= 80){
             return 10;
-        } else {
-            return 4;
         }
+        else { return 4;}
+
     }
 
+    // Inverse du cas précédent
     if (obstacle_from_right && !obstacle_from_left) {
         cout << "[Classify] Signature: right center HIT, left center OPEN." << endl;
         return 8;
     }
 
+    // Les deux côtés vers le centre sont libres
     if (!obstacle_from_right && !obstacle_from_left) {
         cout << "[Classify] Signature: both center probes OPEN." << endl;
 
-        if (_id_brightness <= 100) {
+        if (_id_brightness <= 100){ 
             return 7;
         }
 
         return 6;
     }
-
+    
     if (obstacle_from_right && obstacle_from_left) {
         if (_id_cube_on_left) {
-            if (_id_brightness <= 100) {
-                return 2;
-            } else {
-                return 3;
+            if (_id_brightness <= 100){ 
+            return 2;
             }
+            else{
+                return 3; }
         } else {
-            if (_id_brightness <= 60) {
-                return 9;
-            } else {
-                return 1;
+            if (_id_brightness <= 60){ 
+            return 9;   
             }
+            else{
+                return 1;}
         }
     }
-
     return -1;
 }
-
 //////////////////////////////////////////////
-// Core sensors, odometry, movement helpers
+
+void MyRobot::load_waypoints(int world_id)
+{
+    _waypoints.clear();
+
+    // Waypoints are GPS-world coordinates, NOT relative to the origin.
+    // Long axis of the room runs along x (Webots Z). Original Bug_02 goal was
+    // at x≈9.47, so we sweep from near start toward x≈9.
+    // _origin_y is the lateral starting position — sweep ±3 m around it.
+    // *** Run the simulation once and check [Init] GPS seed to verify direction.
+    //     If victims are behind the robot, negate the x offsets. ***
+
+    double spread = 3.0;   // largeur du zigzag (m)
+
+    _waypoints = {
+        { 1.5,        0.0  },   // 1.5m devant
+        { 1.5,    +spread  },   // puis 3m à gauche
+        { 4.0,    +spread  },   // avance à gauche
+        { 4.0,    -spread  },   // traverse à droite
+        { 6.5,    -spread  },   // avance à droite
+        { 6.5,    +spread  },   // retraverse à gauche
+        { 8.5,    +spread  },
+        { 8.5,    -spread  },
+        { 9.5,        0.0  },   // dernier point au centre, loin devant
+    };
+
+    cout << "[Waypoints] Loaded " << _waypoints.size()
+         << " waypoints (relative to robot start)" << endl;
+}
+
 //////////////////////////////////////////////
 
 void MyRobot::apply_gps_correction()
@@ -1229,10 +1390,6 @@ double MyRobot::right_obstacle()
     return median;
 }
 
-//////////////////////////////////////////////
-// Debug helpers
-//////////////////////////////////////////////
-
 const char* MyRobot::state_name()
 {
     switch (_state) {
@@ -1281,10 +1438,6 @@ const char* MyRobot::object_name(DetectedObject obj)
 
 ////////////////////////////////////////////
 // path following 
-//////////////////////////////////////////////
-// Phase 3/4: path navigation and victim scan
-//////////////////////////////////////////////
-
 void MyRobot::step_initial_turn()
 {
     if (_path.empty()) {
@@ -1298,9 +1451,10 @@ void MyRobot::step_initial_turn()
     if (turn_to_heading(target)) {
         cout << "Heading to waypoint 0 at (" << _path[0].x << ", " << _path[0].y << ")" << endl;
         _state = FOLLOW_PATH;
+        _last_dist_to_wp = dist_to(_path[_current_wp].x, _path[_current_wp].y);
+        _stuck_ticks = 0;
     }
 }
-
 
 void MyRobot::step_follow_path()
 {
