@@ -245,9 +245,9 @@ void MyRobot::run()
             set_speed(0.0, 0.0);
 
             // Force odometry at the known corner. Do not trust odometry before this point.
-            _x = -4.4;
-            _y = -9.42;
-            _theta = -1.5708;   // orientation vers le mur/coin après calibration
+            _y = 4.4;
+            _x = -9.43;
+            _theta = -M_PI / 2.0;  // orientation vers le mur/coin après calibration
             _id_forward_heading = _theta;
 
             cout << "[ODOM_RESET_RIGHT_CORNER] x=" << _x
@@ -1091,7 +1091,7 @@ double MyRobot::measure_front_avg(int samples)
 
     return sum / samples;
 }
-double MyRobot::go_to_point_and_measure_front(double gx, double gy, double final_theta)
+double MyRobot::go_to_point_and_measure_front(double gy, double gx, double final_theta)
 {
     int safety = 0;
 
@@ -1155,21 +1155,21 @@ int MyRobot::idmonde4567()
     cout << "[idmonde4567] Start" << endl;
 
     double front_p1 = go_to_point_and_measure_front(
-        2.15,
-        0.0,
-        3.14159
+        4.26,
+        -7,
+        0.0
     );
 
     if (front_p1 < OPEN_MAX) {
         cout << "[idmonde4567] P1 open => possible WORLD 6 or 7" << endl;
 
         double front_p2 = go_to_point_and_measure_front(
-            -1.75,
-            0.10,
-            3.14159
+            -1,
+            -7,
+            0.0
         );
 
-        if (front_p2 > WALL_MIN) {
+        if (front_p2 >= WALL_MIN) {
             cout << "[idmonde4567] P2 wall detected => WORLD 6" << endl;
             return 6;
         }
@@ -1178,20 +1178,20 @@ int MyRobot::idmonde4567()
         return 7;
     }
 
-    cout << "[idmonde4567] P1 object detected => possible WORLD 4 or 5" << endl;
+    cout << "[idmonde4567] P1 wall detected => possible WORLD 4 or 5" << endl;
 
     double front_p3 = go_to_point_and_measure_front(
-        1.85,
-        1.40,
-        3.14159
+        2.3,
+        -7.7,
+        -M_PI / 2.0
     );
 
     if (front_p3 >= CUBE_MIN) {
-        cout << "[idmonde4567] P3 very close object / cube => WORLD 5" << endl;
+        cout << "[idmonde4567] P3 cube detected => WORLD 5" << endl;
         return 5;
     }
 
-    cout << "[idmonde4567] P3 wall or normal obstacle => WORLD 4" << endl;
+    cout << "[idmonde4567] P2 open => WORLD 4" << endl;
     return 4;
 }
 
@@ -1199,55 +1199,36 @@ int MyRobot::idmonde1810()
 {
     const double OPEN_MAX = 80.0;
     const double WALL_MIN = 120.0;
+    const double CUBE_MIN = 650.0;
 
-    cout << "[idmonde1810] Start" << endl;
+    cout << "[idmonde4567] Start" << endl;
 
-    /*
-      Principe :
-      - On se place à un point qui permet de regarder vers le mur/côté gauche.
-      - Puis on se place à un point qui permet de regarder vers le mur/côté droit.
-      - On utilise front_obstacle() via go_to_point_and_measure_front().
-    */
-
-    double left_check = go_to_point_and_measure_front(
-        -2.0,
-        1.40,
-        3.14159
+    double front_p1 = go_to_point_and_measure_front(
+        4.26,
+        -7,
+        0.0
     );
 
-    bool left_wall = left_check > WALL_MIN;
+    if (front_p1 < OPEN_MAX) {
+        cout << "[idmonde4567] P1 open => world 8" << endl;
+        return 8;
+        
+    }
+    else {
+        cout << "[idmonde4567] P1 wall detected => possible WORLD 1 or 10" << endl;
 
-    cout << "[idmonde1810] left_check=" << left_check
-         << " => left_wall=" << (left_wall ? "YES" : "NO")
-         << endl;
+        double front_p2 = go_to_point_and_measure_front(
+            2.96707,
+            -6.8,
+            0.0
+        );
 
-    double right_check = go_to_point_and_measure_front(
-        -2.0,
-        -1.40,
-        3.14159
-    );
+        if (front_p2 >= WALL_MIN) {
+            cout << "[idmonde4567] P2 wall detected => WORLD 10" << endl;
+            return 10;
+        }
 
-    bool right_wall = right_check > WALL_MIN;
-
-    cout << "[idmonde1810] right_check=" << right_check
-         << " => right_wall=" << (right_wall ? "YES" : "NO")
-         << endl;
-
-    if (left_wall && right_wall) {
-        cout << "[idmonde1810] left wall + right wall => WORLD 1" << endl;
+        cout << "[idmonde4567] P2 open => WORLD 1" << endl;
         return 1;
     }
-
-    if (!left_wall && right_wall) {
-        cout << "[idmonde1810] left open + right wall => WORLD 8" << endl;
-        return 8;
-    }
-
-    if (left_wall && !right_wall) {
-        cout << "[idmonde1810] left wall + right open => WORLD 10" << endl;
-        return 10;
-    }
-
-    cout << "[idmonde1810] Unknown signature" << endl;
-    return -1;
 }
