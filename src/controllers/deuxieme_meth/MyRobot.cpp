@@ -1165,17 +1165,17 @@ int MyRobot::idmonde4567()
 
         double front_p2 = go_to_point_and_measure_front(
             -1,
-            -7,
+            -6.4,
             0.0
         );
 
         if (front_p2 >= WALL_MIN) {
-            cout << "[idmonde4567] P2 wall detected => WORLD 6" << endl;
-            return 6;
+            cout << "[idmonde4567] P2 wall detected => WORLD 7" << endl;
+            return 7;
         }
 
-        cout << "[idmonde4567] P2 open => WORLD 7" << endl;
-        return 7;
+        cout << "[idmonde4567] P2 open => WORLD 6" << endl;
+        return 6;
     }
 
     cout << "[idmonde4567] P1 wall detected => possible WORLD 4 or 5" << endl;
