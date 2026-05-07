@@ -1,4 +1,4 @@
-# Copyright 1996-2020 Cyberbotics Ltd.
+# Copyright 1996-2019 Cyberbotics Ltd.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -39,7 +39,7 @@
 ###
 ### ---- C++ Sources ----
 ### if your program uses several C++ source files:
-### CXX_SOURCES = my_plugin.cc my_clever_algo.cpp my_graphics.c++
+CXX_SOURCES = MyRobot.cpp new.cpp
 ###
 ### ---- Compilation options ----
 ### if special compilation flags are necessary:
@@ -49,6 +49,7 @@
 ### if your program needs additional libraries:
 ### INCLUDE = -I"/my_library_path/include"
 ### LIBRARIES = -L"/path/to/my/library" -lmy_library -lmy_other_library
+LIBRARIES += -l:libpng12.so.0
 ###
 ### ---- Linking options ----
 ### if special linking flags are needed:
@@ -57,6 +58,8 @@
 ### ---- Webots included libraries ----
 ### if you want to use the Webots C API in your C++ controller program:
 ### USE_C_API = true
+### if you want to link with the Qt framework embedded in Webots:
+### QT = core gui widgets network
 ###
 ### ---- Debug mode ----
 ### if you want to display the gcc command line for compilation and link, as
@@ -66,7 +69,6 @@
 ###-----------------------------------------------------------------------------
 
 ### Do not modify: this includes Webots global Makefile.include
-null :=
-space := $(null) $(null)
-WEBOTS_HOME_PATH=$(subst $(space),\ ,$(strip $(subst \,/,$(WEBOTS_HOME))))
+override WEBOTS_HOME := $(abspath ../../../../webots)
+override WEBOTS_HOME_PATH := $(WEBOTS_HOME)
 include $(WEBOTS_HOME_PATH)/resources/Makefile.include

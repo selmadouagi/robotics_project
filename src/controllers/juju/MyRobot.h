@@ -5,7 +5,8 @@
  * @file    MyRobot.h
  * @brief   A header file containing function declarations, world paths, and sensor declarations
  *
- * @author  Julien Vollet, Devon Salgado
+ * @author  Douagi selma Elizabeth Faulkner
+ * @date    2024-06-01
  */
 
 #include <iostream>

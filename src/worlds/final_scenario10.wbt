@@ -9,7 +9,7 @@ WorldInfo {
 }
 Viewpoint {
   orientation -0.5094873405403066 -0.6887369507303992 -0.515813980547016 1.9418934
-  position -8.6885435 31.967301 1.5685876
+  position -10.08762913046495 36.69529474345818 1.5681486170406767
 }
 Background {
   skyColor [
@@ -1837,7 +1837,7 @@ DEF FLOOR Solid {
 Pioneer2_final {
   translation -0.00170413 0 -7.98
   rotation 0 1 0 3.14
-  controller "yay"
+  controller "deuxieme_meth"
   extensionSlot [
     DEF FORWARD_CAMERA Camera {
       translation 0 0.255 -0.155

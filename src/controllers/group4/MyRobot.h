@@ -53,8 +53,8 @@ using namespace webots;
 
 // Navigation tolerances
 #define ANGLE_TOL               0.08    // radians
-#define WAYPOINT_DIST_TOL       0.30    // meters waypoint reached
-#define VICTIM_DIST_TOL         0.35   // meters scoring distance
+#define WAYPOINT_DIST_TOL       0.30    // meters - waypoint reached
+#define VICTIM_DIST_TOL         1.0     // meters - scoring distance
 
 // Rotation control (proportional, avoids overshoot from fixed-speed turns)
 #define ROT_KP                  1.8
@@ -79,8 +79,8 @@ using namespace webots;
 #define CUBE_MAX_DIST_M          1.2      // cube should be close; farther hits are likely room wall
 
 // Forward probe parameters
-#define PROBE_FORWARD_MAX_M      2.0      // hard ca if travelled this far without a hit, NO WALL ahead
-#define PROBE_FORWARD_TIMEOUT    120      // step-count safety nets ~2.4 m worst case
+#define PROBE_FORWARD_MAX_M      2.0      // hard cap -> if travelled this far without a hit, NO WALL ahead
+#define PROBE_FORWARD_TIMEOUT    120      // step-count safety net, ~2.4 m worst case
 
 /////////////////////////////////////////////////
 // WAYPOINT PATHS

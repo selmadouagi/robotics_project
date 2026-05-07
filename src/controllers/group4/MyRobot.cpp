@@ -9,8 +9,8 @@
 #include "MyRobot.h"
 
 namespace {
-constexpr bool DEBUG_LOG = false;  //debugging messs
-static const bool DEBUG_LOG345 = true;    // phase 345
+constexpr bool DEBUG_LOG = true;  //debugging messs
+static const bool DEBUG_LOG345 = false;    // phase 345
 static const bool INFO_LOG = true;         // Important messages
 }
 
@@ -791,18 +791,6 @@ void MyRobot::run()
             if (INFO_LOG) {
                 cout << "[World] Identified WORLD " << _world_id << endl;
             }
-            // Reset odometry before waypoint navigation.
-            _x = 0.0;
-            _y = 0.0;
-            _theta = 0.0;
-            _origin_x = 0.0;
-            _origin_y = 0.0;
-
-            if (_left_wheel_sensor)
-                _prev_left_enc = _left_wheel_sensor->getValue();
-
-            if (_right_wheel_sensor)
-                _prev_right_enc = _right_wheel_sensor->getValue();
 
             load_waypoints(_world_id);
             _current_wp = 0;
@@ -879,15 +867,6 @@ void MyRobot::run()
 
             Waypoint& wp = _waypoints[_current_wp];
             double dist = dist_to(wp.x, wp.y);
-            if (DEBUG_LOG345) {
-                cout << "[WP]"
-                    << " current=" << _current_wp
-                    << " target=(" << wp.x << ", " << wp.y << ")"
-                    << " pos=(" << _x << ", " << _y << ")"
-                    << " dist=" << dist
-                    << " front=" << front
-                    << endl;
-            }
 
             if (dist < WAYPOINT_DIST_TOL) {
                 if (DEBUG_LOG) {

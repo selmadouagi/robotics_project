@@ -7,6 +7,6 @@ centralWidgetVisible: 1
 selectionDisabled: 0
 viewpointLocked: 0
 orthographicViewHeight: 1
-textFiles: 1 "controllers/yay/MyRobot.cpp" "controllers/juju/Makefile"
-renderingDevicePerspectives: Pioneer 2:camera_f;1;1;0;0
+textFiles: 0 "controllers/deuxieme_meth/Makefile"
 renderingDevicePerspectives: Pioneer 2:camera_s;1;1;0;0
+renderingDevicePerspectives: Pioneer 2:camera_f;1;1;0;0
