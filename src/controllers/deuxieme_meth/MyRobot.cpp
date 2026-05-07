@@ -271,10 +271,87 @@ void MyRobot::run()
         case ID_CLASSIFY:
         {
             int world_id = classify_world_full();
-            cout << "Classified world as ID " << world_id << endl;
-            return;
+            _world_id = world_id;
+
+            cout << "Classified world as ID " << _world_id << endl;
+
+            load_path_for_world(_world_id);
+
+            _current_wp = 0;
+            _return_wp = -1;
+            _stuck_ticks = 0;
+            _last_dist_to_wp = 1e9;
+
+            if (_path.empty()) {
+                set_speed(0.0, 0.0);
+                cout << "[ERROR] No path loaded for world " << _world_id << endl;
+                _state = DONE;
+                break;
+            }
+
+            cout << "[PATH] Loaded " << _path.size()
+                << " waypoints for world " << _world_id << endl;
+
+            _state = NAVIGATE_WAYPOINT;
+            break;
         }
-}
+
+        case NAVIGATE_WAYPOINT:
+        {
+            if (_current_wp >= (int)_path.size()) {
+                set_speed(0.0, 0.0);
+                cout << "[NAV] All waypoints reached." << endl;
+
+                _return_wp = (int)_path.size() - 1;
+                _state = RETURN_PATH;
+                break;
+            }
+
+            Waypoint wp = _path[_current_wp];
+
+            cout << "[NAV] Going to wp=" << _current_wp
+                << " target=(" << wp.x << "," << wp.y << ")"
+                << " pos=(" << _x << "," << _y << ")"
+                << " dist=" << dist_to(wp.x, wp.y)
+                << endl;
+
+            if (go_to_point(wp.x, wp.y)) {
+                cout << "[WAYPOINT] reached " << _current_wp << endl;
+                _current_wp++;
+            }
+
+            break;
+        }
+
+        case RETURN_PATH:
+        {
+            if (_return_wp >= 0) {
+                Waypoint wp = _path[_return_wp];
+
+                cout << "[RETURN] Going to wp=" << _return_wp
+                    << " target=(" << wp.x << "," << wp.y << ")"
+                    << " pos=(" << _x << "," << _y << ")"
+                    << " dist=" << dist_to(wp.x, wp.y)
+                    << endl;
+
+                if (go_to_point(wp.x, wp.y)) {
+                    cout << "[RETURN] waypoint reached " << _return_wp << endl;
+                    _return_wp--;
+                }
+
+                break;
+            }
+
+            if (go_to_point(_start_x, _start_y)) {
+                set_speed(0.0, 0.0);
+                cout << "[RETURN] Start reached. Task complete." << endl;
+                _state = TASK_COMPLETE;
+            }
+
+            break;
+        }
+    }
+
         cout << " x=" << _x << " y=" << _y << " θ=" << _theta
              << " front=" << front << " right=" << right
              << " victims=" << _victims_found
@@ -1018,64 +1095,253 @@ bool MyRobot::turn_to_heading_forced_left(double target, double speed)
     return false;
 }
 
-bool MyRobot::go_to_point(double target_x, double target_y)
+bool MyRobot::go_to_point(double gx, double gy)
 {
-    double dx = target_x - _x;
-    double dy = target_y - _y;
+    // ============================================================
+    // Persistent obstacle avoidance for go_to_point()
+    // 0 = normal navigation
+    // 1 = short backup
+    // 2 = turn away from obstacle
+    // 3 = follow around obstacle
+    // ============================================================
+    static int avoid_mode = 0;
+    static int avoid_steps = 0;
+    static double avoid_start_dist = 0.0;
+    static int avoid_side = 0; // -1 = bypass right, +1 = bypass left
+    static double last_gx = 9999.0;
+    static double last_gy = 9999.0;
 
-    double distance = sqrt(dx * dx + dy * dy);
+    // Reset avoidance when target changes
+    if (fabs(gx - last_gx) > 0.01 || fabs(gy - last_gy) > 0.01) {
+        avoid_mode = 0;
+        avoid_steps = 0;
+        avoid_start_dist = 0.0;
+        avoid_side = 0;
+        last_gx = gx;
+        last_gy = gy;
+    }
 
-    if (distance < 0.08) {
+    double front = front_obstacle();
+    double left  = left_obstacle();
+    double right = right_obstacle();
+
+    double dist = dist_to(gx, gy);
+    double target_angle = atan2(gy - _y, gx - _x);
+    double angle_error = normalize_angle(target_angle - _theta);
+
+    const double TARGET_REACHED = 0.10;
+
+    const double FRONT_DETECT = 700.0;
+    const double FRONT_HARD   = 1000.0;
+    const double FRONT_CLEAR  = 250.0;
+
+    const double SIDE_CLOSE = 650.0;
+    const double SIDE_LOST  = 120.0;
+
+    const double TURN_ONLY_ERR = 0.25;
+
+    const double BASE_SPEED = 2.2;
+    const double SLOW_SPEED = 1.4;
+    const double TURN_SPEED = 1.6;
+
+    // Goal reached
+    if (dist < TARGET_REACHED) {
         set_speed(0.0, 0.0);
-        std::cout << "[GO_TO_POINT] REACHED target=(" 
-                  << target_x << "," << target_y << ") current=("
-                  << _x << "," << _y << ")" << std::endl;
+        avoid_mode = 0;
+        avoid_steps = 0;
+
+        cout << "[GO_TO_POINT] REACHED target=(" << gx << "," << gy
+             << ") current=(" << _x << "," << _y << ")" << endl;
+
         return true;
     }
 
-    double target_theta = atan2(dy, dx);
-    double err = normalize_angle(target_theta - _theta);
+    // ============================================================
+    // 1) Start obstacle avoidance
+    // ============================================================
+    if (avoid_mode == 0 && front > FRONT_DETECT) {
+        avoid_start_dist = dist;
+        avoid_steps = 0;
 
-    // Si l'angle est trop mauvais, on tourne d'abord sur place
-    if (fabs(err) > 0.18) {
-        double turn = 2.0 * err;
+        // Lower sensor value = freer side
+        if (right <= left) {
+            avoid_side = -1; // go around by the right
+            cout << "[GO_TO_POINT_AVOID] START bypass RIGHT front="
+                 << front << " left=" << left << " right=" << right << endl;
+        } else {
+            avoid_side = +1; // go around by the left
+            cout << "[GO_TO_POINT_AVOID] START bypass LEFT front="
+                 << front << " left=" << left << " right=" << right << endl;
+        }
 
-        if (turn > 2.0) turn = 2.0;
-        if (turn < -2.0) turn = -2.0;
-
-        set_speed(-turn, turn);
-
-        std::cout << "[GO_TO_POINT] TURN target=(" 
-                  << target_x << "," << target_y << ") dist="
-                  << distance << " target_theta=" << target_theta
-                  << " theta=" << _theta << " err=" << err
-                  << std::endl;
+        if (front > FRONT_HARD) {
+            avoid_mode = 1; // backup first
+        } else {
+            avoid_mode = 2; // directly turn away
+        }
 
         return false;
     }
 
-    // Avance avec correction d'angle
-    double speed = 3.0;
+    // ============================================================
+    // 2) Backup if too close
+    // ============================================================
+    if (avoid_mode == 1) {
+        avoid_steps++;
 
-    if (distance < 0.60) speed = 2.0;
-    if (distance < 0.25) speed = 1.0;
+        set_speed(-1.8, -1.8);
 
-    double corr = 2.5 * err;
+        if (avoid_steps >= 10) {
+            avoid_mode = 2;
+            avoid_steps = 0;
+        }
 
-    if (corr > 0.8) corr = 0.8;
-    if (corr < -0.8) corr = -0.8;
+        cout << "[GO_TO_POINT_AVOID] BACKUP front=" << front
+             << " step=" << avoid_steps << endl;
 
-    set_speed(speed - corr, speed + corr);
+        return false;
+    }
 
-    std::cout << "[GO_TO_POINT] DRIVE target=(" 
-              << target_x << "," << target_y << ") current=("
-              << _x << "," << _y << ") dist=" << distance
-              << " theta=" << _theta << " err=" << err
-              << std::endl;
+    // ============================================================
+    // 3) Turn away from obstacle until front is clear
+    // ============================================================
+    if (avoid_mode == 2) {
+        avoid_steps++;
+
+        if (avoid_side < 0) {
+            // bypass right: turn right
+            set_speed(TURN_SPEED, -TURN_SPEED);
+        } else {
+            // bypass left: turn left
+            set_speed(-TURN_SPEED, TURN_SPEED);
+        }
+
+        cout << "[GO_TO_POINT_AVOID] TURN "
+             << (avoid_side < 0 ? "RIGHT" : "LEFT")
+             << " front=" << front
+             << " step=" << avoid_steps << endl;
+
+        if (front < FRONT_CLEAR || avoid_steps > 45) {
+            avoid_mode = 3;
+            avoid_steps = 0;
+        }
+
+        return false;
+    }
+
+    // ============================================================
+    // 4) Follow around the obstacle
+    // ============================================================
+    if (avoid_mode == 3) {
+        avoid_steps++;
+
+        double current_dist = dist_to(gx, gy);
+        double current_target_angle = atan2(gy - _y, gx - _x);
+        double current_angle_error = normalize_angle(current_target_angle - _theta);
+
+        // Leave avoidance only when:
+        // - front is clear
+        // - we moved enough around the obstacle
+        // - target direction is reasonably reachable
+        // - we are closer than when we hit the obstacle
+        if (avoid_steps > 35 &&
+            front < FRONT_CLEAR &&
+            fabs(current_angle_error) < 0.45 &&
+            current_dist < avoid_start_dist - 0.15)
+        {
+            cout << "[GO_TO_POINT_AVOID] EXIT avoidance, back to target. dist="
+                 << current_dist << " start_dist=" << avoid_start_dist << endl;
+
+            avoid_mode = 0;
+            avoid_steps = 0;
+            return false;
+        }
+
+        // Safety: if avoidance is taking too long, allow retry toward target
+        if (avoid_steps > 220 && front < FRONT_DETECT) {
+            cout << "[GO_TO_POINT_AVOID] TIMEOUT exit, retry target." << endl;
+            avoid_mode = 0;
+            avoid_steps = 0;
+            return false;
+        }
+
+        if (avoid_side < 0) {
+            // Bypass RIGHT: obstacle should stay on the LEFT side.
+            if (front > FRONT_DETECT) {
+                set_speed(TURN_SPEED, -TURN_SPEED);       // turn right
+            }
+            else if (left > SIDE_CLOSE) {
+                set_speed(2.4, 1.0);                      // too close left -> steer right
+            }
+            else if (left < SIDE_LOST) {
+                set_speed(1.0, 2.2);                      // lost obstacle -> curve left
+            }
+            else {
+                set_speed(BASE_SPEED, BASE_SPEED);        // follow side
+            }
+        } else {
+            // Bypass LEFT: obstacle should stay on the RIGHT side.
+            if (front > FRONT_DETECT) {
+                set_speed(-TURN_SPEED, TURN_SPEED);       // turn left
+            }
+            else if (right > SIDE_CLOSE) {
+                set_speed(1.0, 2.4);                      // too close right -> steer left
+            }
+            else if (right < SIDE_LOST) {
+                set_speed(2.2, 1.0);                      // lost obstacle -> curve right
+            }
+            else {
+                set_speed(BASE_SPEED, BASE_SPEED);        // follow side
+            }
+        }
+
+        cout << "[GO_TO_POINT_AVOID] FOLLOW side="
+             << (avoid_side < 0 ? "RIGHT" : "LEFT")
+             << " front=" << front
+             << " left=" << left
+             << " right=" << right
+             << " dist=" << current_dist
+             << " err=" << current_angle_error
+             << " step=" << avoid_steps << endl;
+
+        return false;
+    }
+
+    // ============================================================
+    // 5) Normal go-to-point navigation
+    // ============================================================
+    if (fabs(angle_error) > TURN_ONLY_ERR) {
+        if (angle_error > 0.0) {
+            set_speed(-TURN_SPEED, TURN_SPEED);
+        } else {
+            set_speed(TURN_SPEED, -TURN_SPEED);
+        }
+
+        cout << "[GO_TO_POINT] TURN target=(" << gx << "," << gy << ")"
+             << " dist=" << dist
+             << " target_theta=" << target_angle
+             << " theta=" << _theta
+             << " err=" << angle_error << endl;
+
+        return false;
+    }
+
+    double base = (dist < 0.7) ? SLOW_SPEED : BASE_SPEED;
+    double corr = 2.0 * angle_error;
+
+    double left_speed  = base - corr;
+    double right_speed = base + corr;
+
+    set_speed(left_speed, right_speed);
+
+    cout << "[GO_TO_POINT] DRIVE target=(" << gx << "," << gy << ")"
+         << " current=(" << _x << "," << _y << ")"
+         << " dist=" << dist
+         << " theta=" << _theta
+         << " err=" << angle_error << endl;
 
     return false;
 }
-
 
 // detection spec monde 
 double MyRobot::measure_front_avg(int samples)
